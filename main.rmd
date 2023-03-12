@@ -1,0 +1,1846 @@
+#Description
+R scripts used to generate figures and tables in paper "Spatial Positioning of Immune Hotspots Reflects the Interplay between B and T Cells in Lung Squamous Cell Carcinoma"
+#clear environment
+```{r}
+rm(list = ls())
+```
+#libraries
+```{r}
+library(dplyr)
+library(reshape2)
+library(ggpubr)
+library(ggplot2)
+library(survival)
+library(survminer)
+# library(tidyverse)
+library(RTCGA)
+library(RTCGA.clinical)
+library(gridExtra)
+library(RColorBrewer)
+library(grid)
+library(ggcorrplot)
+library(EDASeq)
+library(TCGAbiolinks)
+library(pheatmap)
+
+```
+#load data
+```{r}
+setwd(dirname(rstudioapi::getSourceEditorContext()$path))
+#TCGA
+load(file.path("data", "TCGA", "survival_LUSC_LUAD.RData"))
+load(file.path("data", "TCGA", "TCGA_LUAD-LUSC_path_EST_ABS_BoLi_DAV.RData"))
+load(file.path("data", "TCGA", "TCGA_LUSC-biolinksGeneExp_immuneHotspot.RData"))
+load(file.path("data", "TCGA", "TCGA_LUAD-biolinksGeneExp_immuneHotspot.RData"))
+load(file.path("data", "TCGA", "Bcell_score_LUSC.RData"))
+load(file.path("data", "TCGA", "lusc_mutload.RData"))
+
+#External validation cohort
+load(file.path("data", "validation", "validation.RData"))
+
+#set save dir
+save_dir <- file.path("results")
+dir.create(save_dir)
+
+```
+
+# Data dictionary
+## TCGA cohort
+## 1. survival_LUSC_LUAD.RData
+TCGA LUSC and LUAD datasets includes immune hotspot, %lymphocytes, %cancer, survival data, smoking history, demographic information, disease stages, tumor mutation burden (TMB), and clonal neoantigens
+
++ *stromal_per, lym_per, tumour_per*: percentages of stromal cells, lymphocytes and tumour cells in total cells automatically detected in H&E slides.
++ *fi*: S_intra/immune, fraction of intratumoral immune hotspots in the immune hotspots.
++ *fc*: S_intra/cancer, proportion of intratumoral immune hotspots to intratumoral immune hotspots + cancer hotspots.
++ *ft*: S_intra/tissue, fraction of ntratumoral immune hotspots in the whole tissue.
+
+## 2. TCGA_LUAD-LUSC_path_EST_ABS_BoLi_DAV.RData
+corresponding scores for the same LUAD and LUSC cases with the following datasets:
++ TCGA pathology manual scores, 
++ ESTIMATE, 
++ Davoli, 
++ BoLi
++ CIBERSORT absolute. 
+
+## 3. TCGA_LUSC-biolinksGeneExp_immuneHotspot.RData, TCGA_LUAD-biolinksGeneExp_immuneHotspot.RData
+summary of gene expression analysis/enrichment for TCGA LUSC, LUAD up/down regulated immune genes~immune hotspot groups.
+
+## 4. Bcell_score_LUSC.RData
+* *LUSCmean_B_cell* B cell scores for LUSC cases estimated by seven algorithms:
++ TIMER
++ CIBERSORT absolute
++ MCP-counter
++ quanTIseq
++ EPIC
++ xCell
++ Danaher
+
+## 5. lusc_mutload.RData
+Tumor mutation burden computed as somatic mutations per Mb using maftools
+
+## Validation cohort
+## 6. sum_valid
+Validation LUSC cohort with serial mIHC sections (n=30 for 10 patients)
++ *x.s, y.s*: coordinates of bottom-right corner of 50x50 μm^2 grids in the slide.
++ *cell.count.all*: number of all cells derived from the registered H&E slide.
++ *cell.count.c*: number of cancer cells derived from the registered H&E slide.
++ *cell.count.l*: number of lymphocytes derived from the registered H&E slide.
++ *Hotspots*: Cancer: cancer hotspots, Cancer-immune: intratumoral immune hotspots, Immune: peritumoral immune hotspots
++ *Region*: TLS: tertiary lymphoid structures, LAG: non-TLS lymphoid aggregates, UD: other regions
++ *T cell subsets* include: cd4: CD4+FOXP3- T cells; cd8: CD8+ T cells; foxp3: CD4+FOXP3+ T cells
++ *B cell subsets* include: cd20: CD20+CXCR5- B cells; cd20cxcr5: CD20+CXCR5+ B cells; cd79bCoexp: CD79b+ B cells; p40: P40+ cancer cells
++ *uc, hem, cxcr5*: stain-negative cells on T and B cell panel and CXCR5 single positive cells 
+
+## 7. df_inter_prop
+Proportions of cell-cell interactions in individual immune hotspots
++ *clump_id*: id of individual immune hotspots
++ *hs_dig*: numeric representation of hotspot types
+
+## 8. rtre
+Target Registration Error between registered and original slides.
++ *sum_d*: sum of distances between benchmarks on the registered and fixed slide.
++ *mean_rTRE, SD_rTRE*: mean and standard diviation of the Target Registration Error representing which represents the distance between original and transformed points normalized by the diagonal length of an image.
+
+# Functions
+```{r}
+#Stratify patient groups by variables
+stratify_df <- function(df, class_column, variable, res.cutLUSCd){
+  df[,class_column] <- df[,variable]
+  df[df[,class_column] > res.cutLUSCd[[variable]]$estimate[[1]], class_column] <- "High"
+  df[df[,class_column] <= res.cutLUSCd[[variable]]$estimate[[1]], class_column] <- "Low"
+  df[,class_column] <- factor(as.character(df[,class_column]), levels = c("Low", "High"))
+  return(df)
+}
+
+
+plt_hs_celltype <- function(df, compare_hs, cell_type = 'cd8', cell_name = 'CD8+ T cells'){
+  p <- ggplot(subset(df, variable == cell_type), aes(x= Hotspots, y = value)) +
+    geom_boxplot(outlier.shape = NA, aes(fill = Hotspots))+
+    geom_dotplot(binaxis='y', stackdir='center', stackratio = 0.8,
+                 position=position_jitter(height = 2, width = 0.1, seed = 233),
+                 dotsize=0.7, aes(fill = Hotspots), color = 'black',stroke=0.8) + 
+    scale_fill_manual(values= c("#E84D3F","#77BFD1","#DEA15B"))+
+    scale_color_manual(values= c("#E84D3F","#77BFD1","#DEA15B"))+
+    ylim(c(0,100)) + ylab(paste0('% of ', cell_name)) +
+    theme_bw() + 
+    theme(axis.text.x = element_blank(), legend.position = 'None', axis.title=element_text(size=18),
+          axis.text=element_text(size=16, colour="black"),
+          panel.grid.major = element_blank(), panel.grid.minor = element_blank(),panel.border = element_blank(),
+          axis.line = element_line(colour = "black"),
+          panel.background = element_blank(), aspect.ratio = 1.6/1.3,
+          axis.ticks.length=unit(.25, "cm")) + xlab('') +
+    annotate(geom = 'segment', x = 1, xend = 2, y = 60, yend = 60, color = subset(compare_hs, variable == cell_type)$line_color[1])+
+    geom_text(x = 1.5, y = 63, label = subset(compare_hs, variable == cell_type)$p_adj_star[1]) +
+    annotate(geom = 'segment', x = 1, xend = 3, y = 75, yend = 75, color = subset(compare_hs, variable == cell_type)$line_color[2])+
+    geom_text(x = 2, y = 78, label = subset(compare_hs, variable == cell_type)$p_adj_star[2]) +
+    annotate(geom = 'segment', x = 2, xend = 3, y = 90, yend = 90, color = subset(compare_hs, variable == cell_type)$line_color[3])+
+    geom_text(x = 2.5, y = 93, label = subset(compare_hs, variable == cell_type)$p_adj_star[3])
+  return(p)
+}
+
+plt_region_celltype <- function(df, compare_region, cell_type = 'cd8', cell_name = 'CD8+ T cells'){
+  p <- ggplot(subset(df,Hotspots %in% c('Immune') & variable == cell_type), aes(x= Region, y = value)) +
+    geom_boxplot(outlier.shape = NA, aes(fill = Region))+
+    geom_dotplot(binaxis='y', stackdir='center', stackratio = 0.3,
+                 position=position_jitter(height = 2, width = 0.1, seed = 233),
+                 dotsize=0.7, aes(fill = Region), color = 'black',stroke=0.8) + 
+    scale_fill_brewer(palette = "Set2")+
+    scale_color_brewer(palette = "Set2")+
+    ylim(c(0,100)) + ylab(paste0('% of ', cell_name)) +
+    theme_bw() + 
+    theme(axis.text.x = element_blank(), legend.position = 'None', axis.title=element_text(size=18),
+          axis.text=element_text(size=16, colour="black"),
+          panel.grid.major = element_blank(), panel.grid.minor = element_blank(),panel.border = element_blank(),
+          axis.line = element_line(colour = "black"),
+          panel.background = element_blank(), aspect.ratio = 1.6/1.3,
+          axis.ticks.length=unit(.25, "cm")) + xlab('') +
+    annotate(geom = 'segment', x = 1, xend = 2, y = 70, yend = 70, color = subset(compare_region, variable == cell_type)$line_color[1])+
+    geom_text(x = 1.5, y = 73, label = subset(compare_region, variable == cell_type)$p_adj_star[1]) +
+    annotate(geom = 'segment', x = 1, xend = 3, y = 85, yend = 85, color = subset(compare_region, variable == cell_type)$line_color[2])+
+    geom_text(x = 2, y = 88, label = subset(compare_region, variable == cell_type)$p_adj_star[2]) +
+    annotate(geom = 'segment', x = 2, xend = 3, y = 100, yend = 100, color = subset(compare_region, variable == cell_type)$line_color[3])+
+    geom_text(x = 2.5, y = 103, label = subset(compare_region, variable == cell_type)$p_adj_star[3])
+  
+  return(p)
+}
+
+plt_sur_by_smokingClass <- function(LUSCmean, class_index, title){
+  
+  df <- subset(LUSCmean, smokingClass == class_index)
+  cut <- surv_cutpoint(df, time = "time", event = "event",
+                       variables = c("fi"))
+  df_cut <- surv_categorize(cut)
+  
+  fit <- survfit(Surv(time, event)~fi, data = df_cut)
+  p<-ggsurvplot(fit, data = df_cut,
+                ylab = "Overall Survival",
+                xlab = "Time (Days)",
+                break.time.by = 500, xlim = c(0,3000),
+                conf.int = F,
+                risk.table = T, risk.table.y.text.col = T, risk.table.y.text = F, risk.table.height = 0.3, 
+                risk.table.title = "No. at Risk", risk.table.fontsize = 4, 
+                pval = T, pval.coord = c(0.1, 0.1,0.1,0.1),
+                legend = c(0.85, 0.8), title = title)
+  return(p) 
+}
+
+cus_theme <-theme(plot.title=element_text(size=16),
+                  axis.text=element_text(size=14),
+                  axis.title=element_text(size=16),
+                  legend.title = element_text(size = 14),
+                  legend.text = element_text(size = 14))
+
+```
+
+#Table 1. Characteristics of the included patients and their association with the Sintra/immune, Sintra/cancer, and Sintra/tissue.
+```{r}
+clin <- survivalTCGA(LUAD.clinical, LUSC.clinical, 
+                     extract.cols=c("admin.disease_code", "patient.days_to_death", "patient.stage_event.pathologic_stage", "patient.histological_type",
+                                    "patient.tobacco_smoking_history", "patient.number_pack_years_smoked", "patient.year_of_tobacco_smoking_onset",
+                                    "patient.stopped_smoking_year", "patient.residual_tumor", "patient.primary_therapy_outcome_success",
+                                    "patient.age_at_initial_pathologic_diagnosis", "patient.drugs.drug.therapy_types.therapy_type", "patient.gender"))
+
+df_LUAD_LUSC <- rbind(LUADmean, LUSCmean)
+
+df_LUAD_LUSC <- merge(df_LUAD_LUSC, clin[,c('bcr_patient_barcode', 'patient.gender')], all.x = T)
+
+
+#=======Histology type=======#
+# df_LUAD_LUSC$fi_group <- ifelse(df_LUAD_LUSC$fi > 0.326, "High", "Low" )
+df_LUAD_LUSC$fi_group <- ifelse(df_LUAD_LUSC$fi > median(df_LUAD_LUSC$fi, na.rm = T), "High", "Low" )
+df_LUAD_LUSC$fc_group <- ifelse(df_LUAD_LUSC$fc > median(df_LUAD_LUSC$fc, na.rm = T), "High", "Low" )
+df_LUAD_LUSC$ft_group <- ifelse(df_LUAD_LUSC$ft > median(df_LUAD_LUSC$ft, na.rm = T), "High", "Low" )
+
+s = nrow(subset(df_LUAD_LUSC, !is.na(admin.disease_code)))
+table(df_LUAD_LUSC$admin.disease_code)
+round(table(df_LUAD_LUSC$admin.disease_code) / s * 100, 2)
+
+table(subset(df_LUAD_LUSC, admin.disease_code == 'lusc')$fi_group)
+round(table(subset(df_LUAD_LUSC, admin.disease_code == 'lusc')$fi_group) / nrow(subset(df_LUAD_LUSC, admin.disease_code == 'lusc')) * 100, 2)
+
+table(subset(df_LUAD_LUSC, admin.disease_code == 'luad')$fi_group)
+round(table(subset(df_LUAD_LUSC, admin.disease_code == 'luad')$fi_group) / nrow(subset(df_LUAD_LUSC, admin.disease_code == 'luad')) * 100, 2)
+
+table(subset(df_LUAD_LUSC, admin.disease_code == 'lusc')$fc_group)
+round(table(subset(df_LUAD_LUSC, admin.disease_code == 'lusc')$fi_group) / nrow(subset(df_LUAD_LUSC, admin.disease_code == 'lusc')) * 100, 2)
+
+table(subset(df_LUAD_LUSC, admin.disease_code == 'luad')$fc_group)
+round(table(subset(df_LUAD_LUSC, admin.disease_code == 'luad')$fi_group) / nrow(subset(df_LUAD_LUSC, admin.disease_code == 'luad')) * 100, 2)
+
+ggboxplot(df_LUAD_LUSC, x = "admin.disease_code", y = "fi",
+               add = "jitter", border = "white")+
+  stat_compare_means(method = "wilcox")
+
+ggboxplot(df_LUAD_LUSC, x = "admin.disease_code", y = "fc",
+               add = "jitter", border = "white")+
+  stat_compare_means(method = "wilcox")
+
+ggboxplot(df_LUAD_LUSC, x = "admin.disease_code", y = "ft",
+               add = "jitter", border = "white")+
+  stat_compare_means(method = "wilcox")
+
+#=======Age=======#
+df_LUAD_LUSC$age_group <- ifelse(df_LUAD_LUSC$age >=65, ">=65", "<65")
+s = nrow(subset(df_LUAD_LUSC, !is.na(age_group)))
+table(df_LUAD_LUSC$age_group)
+round(table(df_LUAD_LUSC$age_group) / nrow(subset(df_LUAD_LUSC, !is.na(age_group))) * 100, 2)
+
+table(subset(df_LUAD_LUSC, age_group == '>=65')$fi_group)
+round(table(subset(df_LUAD_LUSC, age_group == '>=65')$fi_group) / nrow(subset(df_LUAD_LUSC, age_group == '>=65')) * 100, 2)
+
+table(subset(df_LUAD_LUSC, age_group == '<65')$fi_group)
+round(table(subset(df_LUAD_LUSC, age_group == '<65')$fi_group) / nrow(subset(df_LUAD_LUSC, age_group == '<65')) * 100, 2)
+
+ggboxplot(subset(df_LUAD_LUSC, !is.na(age_group)), x = "age_group", y = "fi",
+               add = "jitter", border = "white")+
+  stat_compare_means(method = "wilcox")
+
+ggboxplot(subset(df_LUAD_LUSC, !is.na(age_group)), x = "age_group", y = "fc",
+               add = "jitter", border = "white")+
+  stat_compare_means(method = "wilcox")
+
+ggboxplot(subset(df_LUAD_LUSC, !is.na(age_group)), x = "age_group", y = "ft",
+               add = "jitter", border = "white")+
+  stat_compare_means(method = "wilcox")
+
+#=======sex=======#
+s = nrow(subset(df_LUAD_LUSC, !is.na(patient.gender)))
+table(df_LUAD_LUSC$patient.gender)
+round(table(df_LUAD_LUSC$patient.gender) / nrow(subset(df_LUAD_LUSC, !is.na(patient.gender))) * 100, 2)
+
+table(subset(df_LUAD_LUSC, patient.gender == 'male')$fi_group)
+round(table(subset(df_LUAD_LUSC, patient.gender == 'male')$fi_group) / nrow(subset(df_LUAD_LUSC, patient.gender == 'male')) * 100, 2)
+
+table(subset(df_LUAD_LUSC, patient.gender == 'female')$fi_group)
+round(table(subset(df_LUAD_LUSC, patient.gender == 'female')$fi_group) / nrow(subset(df_LUAD_LUSC, patient.gender == 'female')) * 100, 2)
+
+ggboxplot(subset(df_LUAD_LUSC, !is.na(patient.gender)), x = "patient.gender", y = "fi",
+               add = "jitter", border = "white")+
+  stat_compare_means(method = "wilcox")
+
+ggboxplot(subset(df_LUAD_LUSC, !is.na(patient.gender)), x = "patient.gender", y = "fc",
+               add = "jitter", border = "white")+
+  stat_compare_means(method = "wilcox")
+
+ggboxplot(subset(df_LUAD_LUSC, !is.na(patient.gender)), x = "patient.gender", y = "ft",
+               add = "jitter", border = "white")+
+  stat_compare_means(method = "wilcox")
+
+#=======Smoking history=======#
+s = nrow(subset(df_LUAD_LUSC, !is.na(patient.tobacco_smoking_history)))
+round(table(subset(df_LUAD_LUSC, !is.na(patient.tobacco_smoking_history) & patient.tobacco_smoking_history != "current reformed smoker, duration not specified")$patient.tobacco_smoking_history) / (s-9) * 100, 2)
+
+table(subset(df_LUAD_LUSC, patient.tobacco_smoking_history == 'current reformed smoker for < or = 15 years')$fi_group)
+round(table(subset(df_LUAD_LUSC, patient.tobacco_smoking_history == 'current reformed smoker for < or = 15 years')$fi_group) / nrow(subset(df_LUAD_LUSC, patient.tobacco_smoking_history == 'current reformed smoker for < or = 15 years')) * 100, 2)
+
+table(subset(df_LUAD_LUSC, patient.tobacco_smoking_history == 'current reformed smoker for > 15 years')$fi_group)
+round(table(subset(df_LUAD_LUSC, patient.tobacco_smoking_history == 'current reformed smoker for > 15 years')$fi_group) / nrow(subset(df_LUAD_LUSC, patient.tobacco_smoking_history == 'current reformed smoker for > 15 years')) * 100, 2)
+
+table(subset(df_LUAD_LUSC, patient.tobacco_smoking_history == 'current smoker')$fi_group)
+round(table(subset(df_LUAD_LUSC, patient.tobacco_smoking_history == 'current smoker')$fi_group) / nrow(subset(df_LUAD_LUSC, patient.tobacco_smoking_history == 'current smoker')) * 100, 2)
+
+table(subset(df_LUAD_LUSC, patient.tobacco_smoking_history == 'lifelong non-smoker')$fi_group)
+round(table(subset(df_LUAD_LUSC, patient.tobacco_smoking_history == 'lifelong non-smoker')$fi_group) / nrow(subset(df_LUAD_LUSC, patient.tobacco_smoking_history == 'lifelong non-smoker')) * 100, 2)
+
+ggboxplot(subset(df_LUAD_LUSC, !is.na(patient.tobacco_smoking_history)), x = "patient.tobacco_smoking_history", y = "fi",
+               add = "jitter", border = "white")+
+  stat_compare_means()
+
+ggboxplot(subset(df_LUAD_LUSC, !is.na(patient.tobacco_smoking_history)), x = "patient.tobacco_smoking_history", y = "fc",
+               add = "jitter", border = "white")+
+  stat_compare_means()
+
+ggboxplot(subset(df_LUAD_LUSC, !is.na(patient.tobacco_smoking_history)), x = "patient.tobacco_smoking_history", y = "ft",
+               add = "jitter", border = "white")+
+  stat_compare_means()
+
+#=======pack years=======#
+s = nrow(subset(df_LUAD_LUSC, !is.na(pack_years)))
+df_LUAD_LUSC$pack_year_group <- ifelse(df_LUAD_LUSC$pack_years >=35, ">=35", "<35")
+table(df_LUAD_LUSC$pack_year_group)
+round(table(df_LUAD_LUSC$pack_year_group) / s * 100, 2)
+
+table(subset(df_LUAD_LUSC, pack_year_group == '>=35')$fi_group)
+round(table(subset(df_LUAD_LUSC, pack_year_group == '>=35')$fi_group) / nrow(subset(df_LUAD_LUSC, pack_year_group == '>=35')) * 100, 2)
+
+table(subset(df_LUAD_LUSC, pack_year_group == '<35')$fi_group)
+round(table(subset(df_LUAD_LUSC, pack_year_group == '<35')$fi_group) / nrow(subset(df_LUAD_LUSC, pack_year_group == '<35')) * 100, 2)
+
+ggboxplot(subset(df_LUAD_LUSC, !is.na(pack_year_group)), x = "pack_year_group", y = "fi",
+               add = "jitter", border = "white")+
+  stat_compare_means(method = "wilcox")
+
+ggboxplot(subset(df_LUAD_LUSC, !is.na(pack_year_group)), x = "pack_year_group", y = "fc",
+               add = "jitter", border = "white")+
+  stat_compare_means(method = "wilcox")
+
+ggboxplot(subset(df_LUAD_LUSC, !is.na(pack_year_group)), x = "pack_year_group", y = "ft",
+               add = "jitter", border = "white")+
+  stat_compare_means(method = "wilcox")
+
+#=======TMB=======#
+s = nrow(subset(df_LUAD_LUSC, !is.na(total_perMB)))
+df_LUAD_LUSC$total_perMB_group <- ifelse(df_LUAD_LUSC$total_perMB >=3, ">=3", "<3")
+table(df_LUAD_LUSC$total_perMB_group)
+round(table(df_LUAD_LUSC$total_perMB_group) / s * 100, 2)
+
+table(subset(df_LUAD_LUSC, total_perMB_group == '>=3')$fi_group)
+round(table(subset(df_LUAD_LUSC, total_perMB_group == '>=3')$fi_group) / nrow(subset(df_LUAD_LUSC, total_perMB_group == '>=3')) * 100, 2)
+
+table(subset(df_LUAD_LUSC, total_perMB_group == '<3')$fi_group)
+round(table(subset(df_LUAD_LUSC, total_perMB_group == '<3')$fi_group) / nrow(subset(df_LUAD_LUSC, total_perMB_group == '<3')) * 100, 2)
+
+ggboxplot(subset(df_LUAD_LUSC, !is.na(total_perMB_group)), x = "total_perMB_group", y = "fi",
+               add = "jitter", border = "white")+
+  stat_compare_means(method = "wilcox")
+
+ggboxplot(subset(df_LUAD_LUSC, !is.na(total_perMB_group)), x = "total_perMB_group", y = "fc",
+               add = "jitter", border = "white")+
+  stat_compare_means(method = "wilcox")
+
+ggboxplot(subset(df_LUAD_LUSC, !is.na(total_perMB_group)), x = "total_perMB_group", y = "ft",
+               add = "jitter", border = "white")+
+  stat_compare_means(method = "wilcox")
+
+#=======stages=======#
+s = nrow(subset(df_LUAD_LUSC, !is.na(stage_merge)))
+table(df_LUAD_LUSC$stage_merge)
+round(table(df_LUAD_LUSC$stage_merge) / s * 100, 2)
+
+table(subset(df_LUAD_LUSC, stage_merge == 'ia')$fi_group)
+round(table(subset(df_LUAD_LUSC, stage_merge == 'ia')$fi_group) / nrow(subset(df_LUAD_LUSC, stage_merge == 'ia')) * 100, 2)
+
+table(subset(df_LUAD_LUSC, stage_merge == 'ib')$fi_group)
+round(table(subset(df_LUAD_LUSC, stage_merge == 'ib')$fi_group) / nrow(subset(df_LUAD_LUSC, stage_merge == 'ib')) * 100, 2)
+
+table(subset(df_LUAD_LUSC, stage_merge == 'iia')$fi_group)
+round(table(subset(df_LUAD_LUSC, stage_merge == 'iia')$fi_group) / nrow(subset(df_LUAD_LUSC, stage_merge == 'iia')) * 100, 2)
+
+table(subset(df_LUAD_LUSC, stage_merge == 'iib')$fi_group)
+round(table(subset(df_LUAD_LUSC, stage_merge == 'iib')$fi_group) / nrow(subset(df_LUAD_LUSC, stage_merge == 'iib')) * 100, 2)
+
+table(subset(df_LUAD_LUSC, stage_merge == 'iiia')$fi_group)
+round(table(subset(df_LUAD_LUSC, stage_merge == 'iiia')$fi_group) / nrow(subset(df_LUAD_LUSC, stage_merge == 'iiia')) * 100, 2)
+
+table(subset(df_LUAD_LUSC, stage_merge == 'iv')$fi_group)
+round(table(subset(df_LUAD_LUSC, stage_merge == 'iv')$fi_group) / nrow(subset(df_LUAD_LUSC, stage_merge == 'iv')) * 100, 2)
+
+ggboxplot(subset(df_LUAD_LUSC, !is.na(stage_merge)), x = "stage_merge", y = "fi",
+               add = "jitter", border = "white")+
+  stat_compare_means()
+
+ggboxplot(subset(df_LUAD_LUSC, !is.na(stage_merge)), x = "stage_merge", y = "fc",
+               add = "jitter", border = "white")+
+  stat_compare_means()
+
+ggboxplot(subset(df_LUAD_LUSC, !is.na(stage_merge)), x = "stage_merge", y = "ft",
+               add = "jitter", border = "white")+
+  stat_compare_means()
+```
+
+# Fig. 1  Immune hotspots in LUSC
+## Fig. 1C
+```{r}
+#Optimize threshold for the discovery set
+LUSCdisc <- subset(LUSCmean, cohort == "disc")
+LUSCvalid <- subset(LUSCmean, cohort == "valid")
+
+res.cutLUSCd <- surv_cutpoint(LUSCdisc, time = "time", event = "event",
+                              variables = c("fi", "lym_per"))
+res.catLUSCd <- surv_categorize(res.cutLUSCd)
+
+LUSCvalid <- stratify_df(LUSCvalid, "fiC", "fi", res.cutLUSCd)
+LUSCvalid <- stratify_df(LUSCvalid, "lym_perC", "lym_per", res.cutLUSCd)
+
+#survival plot
+fit <- survfit(Surv(time, event)~fiC, data = LUSCvalid)
+
+ggsurvplot(fit, data = LUSCvalid, risk.table = T,  break.time.by = 500, 
+           ylab = "Overall Survival",
+           xlab = "Time (Days)",
+           palette = c("#00BFFF", "#EE0000"),
+           pval = T, pval.coord = c(0.1, 0.1))
+```
+
+## Fig. 1D
+```{r}
+res.cutLUSCd <- surv_cutpoint(LUSCdisc, time = "time", event = "event",
+                              variables = c("fi", "lym_per"))
+res.catLUSCd <- surv_categorize(res.cutLUSCd)
+
+LUSCvalid <- stratify_df(LUSCvalid, "fiC", "fi", res.cutLUSCd)
+LUSCvalid <- stratify_df(LUSCvalid, "lym_perC", "lym_per", res.cutLUSCd)
+
+fitd <- coxph(Surv(time, event)~fiC+age+stage_merge+pack_years, data = LUSCvalid)
+ggforest(fitd, main = "TCGA LUSC: validation cohort")
+
+```
+## Fig. 1E
+```{r}
+ggscatter(LUSCmean, 
+          x = "fi", y = "lym_per", 
+          add = "reg.line", 
+          xlab = expression('S'['intra/immune']), 
+          ylab = "Lymphocyte%",
+          color = "blue4",
+          conf.int = TRUE, size = 2,
+          add.params = list(color = "grey50", fill = "azure3"), 
+          cor.coef = TRUE, cor.method = "spearman") + cus_theme
+```
+
+## Fig. 1F
+```{r}
+
+res.cutLUSCd <- surv_cutpoint(LUSCmean, time = "time", event = "event",minprop = 0.2,
+                              variables = c("fi", "lym_per"))
+res.catLUSCd <- surv_categorize(res.cutLUSCd)
+
+LUSCmean <- stratify_df(LUSCmean, "fiC", "fi", res.cutLUSCd)
+LUSCmean <- stratify_df(LUSCmean, "lym_perC", "lym_per", res.cutLUSCd)
+
+LUSCmean$fi_lym <- ifelse(LUSCmean$lym_perC == "High" & LUSCmean$fiC == "Low", "Low score high lym%", "All others")
+LUSCmean$fi_lym <- factor(LUSCmean$fi_lym, levels = c("Low score high lym%", "All others"))
+
+fit <- survfit(Surv(time, event)~fi_lym, data = LUSCmean)
+
+ggsurvplot(fit, data = LUSCmean, risk.table = T,  break.time.by = 500, 
+           ylab = "Overall Survival",
+           xlab = "Time (Days)",
+           palette = c("#00BFFF", "#EE0000"),
+           pval = T, pval.coord = c(0.1, 0.1))
+
+
+LUSCmean$fi_lym <- factor(LUSCmean$fi_lym, levels = c("All others", "Low score high lym%"))
+fitd <- coxph(Surv(time, event)~fi_lym, data = LUSCmean)
+ggforest(fitd, main = "TCGA LUSC: validation cohort")
+
+```
+
+#Fig.2
+## Fig. 2A
+```{r}
+# Enrichment Analysis EA (TCGAVisualize)
+# Gene Ontology (GO) and Pathway enrichment barPlot
+TCGAvisualize_EAbarplot(tf = rownames(ansEA$ResBP), 
+                        GOBPTab = ansEA$ResBP,
+                        GOCCTab = ansEA$ResCC,
+                        GOMFTab = ansEA$ResMF,
+                        PathTab = ansEA$ResPat,
+                        nRGTab = Genelist, 
+                        nBar = 10,
+                        filename=file.path(save_dir, "TCGAvisualize_EAbarplot_fiLUSC_updated.pdf"))
+```
+
+## Fig. 2B
+```{r}
+TCGAVisualize_volcano(x = dataDEGs$logFC,
+                      y = dataDEGs$FDR,
+                      x.cut = 3,
+                      y.cut = 10^-5,
+                      names = rownames(dataDEGs),
+                      color = c("black","red","darkgreen"),
+                      names.size = 2,
+                      xlab = " Gene expression fold change (Log2)",
+                      legend = "State",
+                      highlight = c("CD19", "CD79B", "MS4A1", "CD20", "CXCR5", "FCER2"),
+                      title = "Volcano plot (fi-high vs fi-low)",
+                      show.names = "both",
+                      width = 10,
+                      filename = file.path(save_dir, "volcano_fiLUSC_verySigBcell_FCER2_remove_xth.pdf"))
+
+```
+
+## Fig. 2C
+```{r}
+LUSCmean$fiC_median <- ifelse(LUSCmean$fi >= median(LUSCmean$fi, na.rm = T), "High", "Low")
+
+LUSCmean_B_cell <- merge(LUSCmean_B_cell, LUSCmean[,c("bcr_patient_barcode", "fiC_median")], all.x = T)
+
+df_m <- melt(LUSCmean_B_cell)
+
+#P value adjustment
+compare_means(value ~ fiC_median, data = df_m, group.by = "variable", p.adjust.method = "BH")
+
+ggboxplot(df_m, x = "fiC_median", y = "value", facet.by = "variable",#title = "EPIC",
+             xlab = "S_intra/immune",size=0.5, scales = "free_y",
+             color = "fiC_median", palette = c("#EE0000", "#00BFFF"), 
+             add = "jitter", border = "white")+
+            stat_compare_means(label = "p.format", label.x = 1.3)+
+            theme(text = element_text(size=18))+
+            theme(legend.position="")+
+            theme(plot.title = element_text(hjust = 0.5))
+
+
+```
+#Fig. 4
+## Fig. 4B
+```{r}
+df <- subset(sum_valid, Hotspots %in% c("Cancer-immune", "Immune"))
+
+df <- df %>%
+  group_by(slide, Hotspots) %>%
+  summarise(cd8 = sum(cd8, na.rm = TRUE), cd4 = sum(cd4, na.rm = TRUE),
+            foxp3 = sum(foxp3, na.rm=TRUE), cd20 = sum(cd20, na.rm=TRUE),
+            cd20cxcr5 = sum(cd20cxcr5, na.rm = TRUE), cd79bCoexp = sum(cd79bCoexp, na.rm=TRUE), area = paste(x.s, y.s) %>% unique %>% length())
+
+#devide by the total area of hotspots
+
+df[,setdiff(colnames(df), c('slide','Hotspots', 'area'))] <- df[,setdiff(colnames(df), c('slide','Hotspots', 'area'))] / df$area / (50*50) * 10^6 
+df$area <- NULL
+
+df <- melt(df, id = c('slide','Hotspots'))
+
+df$Hotspots <- factor(df$Hotspots , levels = c('Cancer-immune','Immune'))
+
+#statistic
+compare_hs <- compare_means(value ~ Hotspots, p.adjust.method = "BH", method='wilcox.test', paired = T,
+                            group.by = "variable",
+                            data =  df) %>%
+  mutate(y_pos = rep(75,6), p.adj = format.pval(p.adj, digits = 2),
+         p_adj_star = ifelse(as.numeric(gsub("< ", "", p.adj)) <0.0001, '****', 
+                             ifelse(as.numeric(gsub("< ", "", p.adj)) < 0.001, '***', 
+                                    ifelse(as.numeric(gsub("< ", "", p.adj)) < 0.01, '**', 
+                                           ifelse(as.numeric(gsub("< ", "", p.adj)) < 0.05, '*', '')))))  %>%
+  mutate(line_color = ifelse(p_adj_star == "", "white", "black"))
+
+compare_hs
+
+ggplot(df, aes(x= Hotspots, y = value)) + facet_grid(. ~ variable) + 
+  geom_boxplot(outlier.shape = NA, aes(fill = Hotspots))+
+  geom_dotplot(binaxis='y', stackdir='center', stackratio = 0.8,
+               position=position_jitter(height = 2, width = 0.1, seed = 233),
+               dotsize=1, aes(fill = Hotspots), color = 'black',stroke=0.4) + 
+  scale_fill_manual(values= c("#A0C588","#636AA8"))+
+  scale_color_manual(values= c("#A0C588","#636AA8"))+
+  ylab(bquote(.(paste0("Cell counts", " /")) ~ mm^2)) +
+  theme_bw() + 
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank() ,
+        legend.position = 'None', axis.title=element_text(size=18),
+        axis.text=element_text(size=16, colour="black"),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),panel.border = element_blank(),
+        axis.line = element_line(colour = "black"),
+        panel.background = element_blank(), aspect.ratio = 1.6/1.3,
+        axis.ticks.length=unit(.25, "cm")) + xlab('')
+```
+
+## Fig. 4C
+```{r}
+#sum by region and get density
+df <- subset(sum_valid, Hotspots %in% c("Cancer-immune", "Immune"))
+
+df <- df %>%
+  group_by(slide, Region) %>%
+  summarise(cd8 = sum(cd8, na.rm = TRUE), cd4 = sum(cd4, na.rm = TRUE),
+            foxp3 = sum(foxp3, na.rm=TRUE), cd20 = sum(cd20, na.rm=TRUE),
+            cd20cxcr5 = sum(cd20cxcr5, na.rm = TRUE), cd79bCoexp = sum(cd79bCoexp, na.rm=TRUE), area = paste(x.s, y.s) %>% unique %>% length())
+
+df[,setdiff(colnames(df), c('slide','area', 'Region'))] <- df[,setdiff(colnames(df), c('slide','area', 'Region'))] / df$area / (50*50) * 10^6 
+df$area <- NULL
+
+df <- melt(df, id = c('slide','Region'))
+
+df$Region <- factor(df$Region  , levels = c('TLS','LAG', 'UD'))
+
+#statistic
+
+df <- tidyr::complete(df, slide, Region, variable, fill = list(value=NA))
+
+compare_region <- compare_means(value ~ Region, p.adjust.method = "BH", method='wilcox.test', paired = T,
+                                group.by = "variable",
+                                data =  df) %>%
+  mutate(y_pos =rep(c(80, 95, 110),6), p.adj = format.pval(p.adj, digits = 2),
+         p_adj_star = ifelse(as.numeric(gsub("< ", "", p.adj)) <0.0001, '****', 
+                             ifelse(as.numeric(gsub("< ", "", p.adj)) < 0.001, '***', 
+                                    ifelse(as.numeric(gsub("< ", "", p.adj)) < 0.01, '**', 
+                                           ifelse(as.numeric(gsub("< ", "", p.adj)) < 0.05, '*', ''))))) %>%
+  mutate(line_color = ifelse(p_adj_star == "", "white", "black"))
+
+compare_region
+
+ggplot(df, aes(x= Region, y = value)) + facet_grid(. ~ variable) + 
+  geom_boxplot(outlier.shape = NA, aes(fill = Region))+
+  geom_dotplot(binaxis='y', stackdir='center', stackratio = 0.8,
+               position=position_jitter(height = 2, width = 0.1, seed = 233),
+               dotsize=1, aes(fill = Region), color = 'black',stroke=0.4) + 
+  scale_fill_brewer(palette = "Set2")+
+  scale_color_brewer(palette = "Set2")+
+  ylab(bquote(.(paste0("Cell counts", " /")) ~ mm^2)) +
+  
+  theme_bw() + 
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank() ,
+        legend.position = 'None', axis.title=element_text(size=18),
+        axis.text=element_text(size=16, colour="black"),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),panel.border = element_blank(),
+        axis.line = element_line(colour = "black"),
+        panel.background = element_blank(), aspect.ratio = 1.6/1.3,
+        axis.ticks.length=unit(.25, "cm")) + xlab('')
+
+```
+
+## Fig. 4D
+```{r}
+df_region_ratio <- sum_valid %>% group_by(Hotspots, Region, slide) %>% summarise(n = n())
+
+df_region_ratio <- subset(df_region_ratio, Hotspots %in% c('Cancer-immune','Immune'))
+
+df_region_ratio_sum <- df_region_ratio %>% group_by(slide, Hotspots) %>% summarise(sum_n = sum(n))
+
+df_region_ratio <- merge(df_region_ratio, df_region_ratio_sum, by = c('slide', 'Hotspots'))
+
+df_all <- df_region_ratio %>% group_by(Region, Hotspots) %>% summarise(n_region = sum(n, na.rm = T))
+df_all$Region <- factor(df_all$Region, levels = c("TLS", "LAG", "UD"))
+
+#Peritumoral IH
+df <- subset(df_all, Hotspots == 'Immune') 
+
+df$labs <- paste0(df$n_region, "/", sum(df$n_region))
+df$labs <- df$n_region / sum(df$n_region) * 100
+df$labs <- paste0(round(df$labs,2), '%')
+df <- as.data.frame(df)
+ggpie(df, "n_region", label = 'labs', lab.pos = "out", lab.font = "white",
+      fill = "Region", color = "Gray",
+      palette = 'Set2', title = 'Composition of Regions at peritumoral immune hotspots')
+
+#Intratumoral IH
+df <- subset(df_all, Hotspots == 'Cancer-immune') 
+
+df$labs <- paste0(df$n_region, "/", sum(df$n_region))
+df$labs <- df$n_region / sum(df$n_region) * 100
+df$labs <- paste0(round(df$labs,2), '%')
+df <- as.data.frame(df)
+ggpie(df, "n_region", label = 'labs', lab.pos = "out", lab.font = "white",
+      fill = "Region", color = "Gray",
+      palette = 'Set2', title = 'Composition of Regions at intratumoral immune hotspots')
+
+```
+
+## Fig. 4E
+```{r}
+df_region_ratio <- sum_valid %>% group_by(Hotspots, Region, slide) %>% summarise(n = n())
+
+df_region_ratio <- subset(df_region_ratio, Hotspots %in% c('Cancer-immune','Immune'))
+
+df_region_ratio_sum <- df_region_ratio %>% group_by(slide, Hotspots) %>% summarise(sum_n = sum(n))
+df_region_ratio <- merge(df_region_ratio, df_region_ratio_sum, by = c('slide', 'Hotspots'))
+df_region_ratio$ratio <- df_region_ratio$n / df_region_ratio$sum_n * 100
+
+df_region_ratio <- tidyr::complete(df_region_ratio, slide, Region, Hotspots, fill = list(ratio=0))
+
+#TLS
+#average in peritumoral IH
+mean(subset(df_region_ratio, Region == 'TLS' & Hotspots %in% c('Immune'))$ratio)
+#sd in peritumoral IH
+sd(subset(df_region_ratio, Region == 'TLS' & Hotspots %in% c('Immune'))$ratio)
+
+#average in intratumoral IH
+mean(subset(df_region_ratio, Region == 'TLS' & Hotspots %in% c('Cancer-immune'))$ratio)
+#sd in intratumoral IH
+sd(subset(df_region_ratio, Region == 'TLS' & Hotspots %in% c('Cancer-immune'))$ratio)
+
+df_p <- compare_means(ratio ~ Hotspots, p.adjust.method = "BH", method='wilcox.test', paired = T, 
+                      data = subset(df_region_ratio, Region == 'TLS' & Hotspots %in% c('Cancer-immune','Immune'))) 
+
+p <- ggboxplot(subset(df_region_ratio, Region == 'TLS' & Hotspots %in% c('Cancer-immune','Immune')), x = 'Hotspots', y = 'ratio', 
+          fill = 'Hotspots', palette = c("#EE0000","#00BFFF"), add = "jitter", add.params = list(color="black", size=1)) +
+  theme_bw() + ylab('% of area') +
+  theme( axis.title=element_text(size=18),
+         axis.text=element_text(size=16, colour="black"),
+         panel.grid.major = element_blank(), panel.grid.minor = element_blank(),panel.border = element_blank(),
+         axis.line = element_line(colour = "black"),
+         panel.background = element_blank(), aspect.ratio = 1.6/1.3, 
+         axis.ticks.length=unit(.25, "cm"), axis.text.x = element_blank(), axis.title.x = element_blank()) +
+  geom_text(x=1.5, y = 15, label=paste0("p = ", df_p$p.adj), color = 'black', size=7)
+
+
+#LAG
+
+#average in peritumoral IH
+mean(subset(df_region_ratio, Region == 'LAG' & Hotspots %in% c('Immune'))$ratio)
+#sd in peritumoral IH
+sd(subset(df_region_ratio, Region == 'LAG' & Hotspots %in% c('Immune'))$ratio)
+
+#average in intratumoral IH
+mean(subset(df_region_ratio, Region == 'LAG' & Hotspots %in% c('Cancer-immune'))$ratio)
+#sd in intratumoral IH
+sd(subset(df_region_ratio, Region == 'LAG' & Hotspots %in% c('Cancer-immune'))$ratio)
+
+df_p <- compare_means(ratio ~ Hotspots, p.adjust.method = "BH", method='wilcox.test', paired = T, 
+                      data = subset(df_region_ratio, Region == 'LAG' & Hotspots %in% c('Cancer-immune','Immune'))) 
+
+p <- ggboxplot(subset(df_region_ratio, Region == 'LAG' & Hotspots %in% c('Cancer-immune','Immune')), x = 'Hotspots', y = 'ratio', 
+          fill = 'Hotspots', palette = c("#EE0000","#00BFFF"), add = "jitter", add.params = list(color="black", size=1)) +
+  theme_bw() + ylab('% of area') +
+  theme( axis.title=element_text(size=18),
+         axis.text=element_text(size=16, colour="black"),
+         panel.grid.major = element_blank(), panel.grid.minor = element_blank(),panel.border = element_blank(),
+         axis.line = element_line(colour = "black"),
+         panel.background = element_blank(), aspect.ratio = 1.6/1.3, 
+         axis.ticks.length=unit(.25, "cm"), axis.text.x = element_blank(), axis.title.x = element_blank()) +
+  geom_text(x=1.5, y = 8.5, label=paste0("p = ", df_p$p.adj), color = 'black', size=7)
+
+```
+# Fig. 5
+## Fig. 5B
+```{r}
+library(vegan)
+df_inter_den <- df_inter_prop
+df_den <- df_inter_den[,which(colnames(df_inter_den) == "cd20") : which(colnames(df_inter_den) == "foxp3")]
+df_inter <- df_inter_den[,which(colnames(df_inter_den) == "cd20cxcr5.cd4") : which(colnames(df_inter_den) == "cd20.cd79bCoexp")]
+
+df_den$shannon_den <- diversity(df_den[,1:6], index = "shannon")
+df_inter$shannon_inter <- diversity(df_inter, index = "shannon")
+df_den <- cbind(df_den, df_inter_den[,c("hs", "clump_id", "slide", "clump_area", "hs_dig")])
+df_inter <- cbind(df_inter, df_inter_den[,c("hs", "clump_id", "slide", "clump_area", "hs_dig")])
+
+df_p <- compare_means(shannon_den ~ hs_dig, p.adjust.method = "BH", method='wilcox.test', paired = F,
+                      data = df_den)
+
+df_p_inter <- compare_means(shannon_inter ~ hs_dig, p.adjust.method = "BH", method='wilcox.test', paired = F, 
+                      data = df_inter)
+
+df_den$shannon_inter <- df_inter$shannon_inter
+
+colnames(df_den)[which(colnames(df_den) == 'hs')] <- "Hotspots"
+levels(df_den$Hotspots) <- c("Intra", "Peri")
+
+df <- df_den[,c('shannon_den', 'shannon_inter', 'Hotspots')]
+
+df <- melt(df)
+
+p <- ggboxplot(df, x = 'Hotspots', y = 'value', color = 'Hotspots', palette = c("#A0C588","#636AA8"), add = "jitter", facet.by = "variable") +
+  theme_bw() + ylab('Shannon diversity') +
+  theme( axis.title=element_text(size=18),
+         axis.text=element_text(size=16, colour="black"),
+         panel.grid.major = element_blank(), panel.grid.minor = element_blank(),panel.border = element_blank(),
+         axis.line = element_line(colour = "black"),
+         panel.background = element_blank(), aspect.ratio = 1.6/1.3, 
+         axis.ticks.length=unit(.25, "cm"), axis.text.x = element_blank(), axis.title.x = element_blank(),
+         axis.ticks.x = element_blank()) +
+  geom_text(x=1.5, y = 2, label=paste0("p = ", df_p_inter$p.adj), color = 'black', size=7) +
+  ylim(c(-0.1,2))
+
+```
+
+## Fig. 5C
+```{r}
+df_inter <- df_inter_den[, which(colnames(df_inter_den) == "cd20cxcr5.cd4") : which(colnames(df_inter_den) == "cd20.cd79bCoexp")]
+variable_list <- colnames(df_inter)
+
+df_inter$hs_dig <- df_inter_den$hs_dig
+
+coef_all <- data.frame()
+df <- df_inter
+
+for (v in variable_list){
+  print(v)
+  logit  <- glm(as.formula(paste("hs_dig~", v)), data = df, family = "binomial")
+  
+  sum_df <- summary(logit)
+  
+  sum_df_coef <- data.frame(sum_df$coefficients)
+  
+  coef_all <- rbind(coef_all, sum_df_coef[2,])
+}
+
+coef_all$p_adj <- p.adjust(coef_all$Pr...z.., method = "BH")
+
+coef_all <- coef_all %>% mutate(p_star = ifelse(as.numeric(gsub("< ", "", Pr...z..)) <0.0001, '****', 
+                                                ifelse(as.numeric(gsub("< ", "", Pr...z..)) < 0.001, '***', 
+                                                       ifelse(as.numeric(gsub("< ", "", Pr...z..)) < 0.01, '**', 
+                                                              ifelse(as.numeric(gsub("< ", "", Pr...z..)) < 0.05, '*', ''))))) %>%
+  mutate(p_adj_star = ifelse(as.numeric(gsub("< ", "", p_adj)) <0.0001, '****', 
+                             ifelse(as.numeric(gsub("< ", "", p_adj)) < 0.001, '***', 
+                                    ifelse(as.numeric(gsub("< ", "", p_adj)) < 0.01, '**', 
+                                           ifelse(as.numeric(gsub("< ", "", p_adj)) < 0.05, '*', ''))))) 
+
+
+coef_all$Variable <- rownames(coef_all)
+coef_all$color <- ifelse(coef_all$Estimate<0 & coef_all$p_adj_star != "", "red", "grey")
+coef_all$log_q <- -log10(coef_all$p_adj)
+
+p <- ggscatter(data = coef_all, x = "Variable", y = "Estimate", color = "color", size = 4, palette = c("grey70", "maroon")) +coord_flip() + theme(axis.text.x = element_text(angle = 90))+
+  geom_hline(yintercept = 0, linetype = 2) + ylim(c(-30, 30))
+
+```
+
+# Fig. 6
+```{r}
+df_cell_cd8_foxp3_bcell <- sum_valid
+
+df_cell_cd8_foxp3_bcell$sum_cells <- rowSums(df_cell_cd8_foxp3_bcell[,c(which(colnames(df_cell_cd8_foxp3_bcell)=='cd4'):which(colnames(df_cell_cd8_foxp3_bcell)=='foxp3'),which(colnames(df_cell_cd8_foxp3_bcell)=='cd20'):which(colnames(df_cell_cd8_foxp3_bcell)=='cd79bCoexp'))])
+
+df_cell_cd8_foxp3_bcell$bcells <- rowSums(df_cell_cd8_foxp3_bcell[,which(colnames(df_cell_cd8_foxp3_bcell)=='cd20'):which(colnames(df_cell_cd8_foxp3_bcell)=='cd79bCoexp')])
+
+df_cell_cd8_foxp3_bcell_cl <- subset(df_cell_cd8_foxp3_bcell, Hotspots == "Cancer-immune")
+df_cell_cd8_foxp3_bcell_l <- subset(df_cell_cd8_foxp3_bcell, Hotspots == "Immune")
+
+df <- df_cell_cd8_foxp3_bcell_l %>% group_by(slide) %>% summarise(n = n())
+
+df_cell_cd8_foxp3_bcell_cl$Hotspots <- 'Intratumoral IH'
+df_cell_cd8_foxp3_bcell_l$Hotspots <- 'Peritumoral IH'
+
+
+select_col <- c('slide', 'Hotspots', 'Region', 'clump_id', 'cd8', 'cd4', 'foxp3', 'cd20', 'cd20cxcr5', 'cd79bCoexp', 'sum_cells', 'bcells')
+
+df_cl_l <- rbind(df_cell_cd8_foxp3_bcell_l[, select_col], df_cell_cd8_foxp3_bcell_cl[, select_col])
+
+#exclude TLS and LAG
+df_cl_l <- subset(df_cl_l, Region == "UD")
+
+df_cl_l <- df_cl_l %>% group_by(slide, Hotspots, clump_id) %>% summarise(cd8 = sum(cd8, na.rm = TRUE), cd4 = sum(cd4, na.rm = TRUE), foxp3 = sum(foxp3, na.rm=TRUE), cd20 = sum(cd20, na.rm=TRUE), cd20cxcr5 = sum(cd20cxcr5, na.rm = TRUE), cd79bCoexp = sum(cd79bCoexp, na.rm=TRUE),sum_cells = sum(sum_cells, na.rm = TRUE))
+
+
+df_cl_l$bcells <- rowSums(df_cl_l[,c('cd20', 'cd20cxcr5', 'cd79bCoexp')]) / df_cl_l$sum_cells
+
+df_cl_l[,c('cd8', 'cd4', 'foxp3', 'cd20', 'cd20cxcr5', 'cd79bCoexp')] <- df_cl_l[,c('cd8', 'cd4', 'foxp3', 'cd20', 'cd20cxcr5', 'cd79bCoexp')] / df_cl_l$sum_cells
+
+#======CD8/FOXP3 between intra and peritumoral======#
+df_cl_l$cd8_foxp3 <-  as.numeric(df_cl_l$cd8 / df_cl_l$foxp3)
+
+df <- subset(df_cl_l, Hotspots == "Intratumoral IH")
+df <- subset(df, is.finite(cd8_foxp3))
+sd(df$cd8_foxp3, na.rm = T)
+mean(df$cd8_foxp3, na.rm = T)
+
+df <- subset(df_cl_l, Hotspots == "Peritumoral IH")
+df <- subset(df, is.finite(cd8_foxp3))
+sd(df$cd8_foxp3, na.rm = T)
+mean(df$cd8_foxp3, na.rm = T)
+
+p <- ggboxplot(subset(df_cl_l, !is.na(cd8_foxp3)), y = 'cd8_foxp3', x = 'Hotspots', add = 'jitter', color = 'Hotspots', palette = c("firebrick4", "tan3")) + 
+  stat_compare_means(label = "p.format", label.x = 1.4, paired = F, label.y = 50) + 
+  xlab('') +
+  cus_theme
+
+
+df_cl_l_1 <- subset(df_cl_l, Hotspots == 'Intratumoral IH')
+df_cl_l_2 <- subset(df_cl_l, Hotspots == 'Peritumoral IH')
+
+#assign high/low for intratumoral and peritumoral IH respectively
+df_cl_l_1$cd8_foxp3_class <- ifelse(df_cl_l_1$cd8_foxp3 >= median(df_cl_l_1$cd8_foxp3, na.rm = T), "High", "Low")
+df_cl_l_2$cd8_foxp3_class <- ifelse(df_cl_l_2$cd8_foxp3 >= median(df_cl_l_2$cd8_foxp3, na.rm = T), "High", "Low")
+
+df_cl_l_1$foxp3_class <- ifelse(df_cl_l_1$foxp3 >= median(df_cl_l_1$foxp3, na.rm = T), "High", "Low")
+df_cl_l_2$foxp3_class <- ifelse(df_cl_l_2$foxp3 >= median(df_cl_l_2$foxp3, na.rm = T), "High", "Low")
+
+df_cl_l_1$cd8_class <- ifelse(df_cl_l_1$cd8 >= median(df_cl_l_1$cd8, na.rm = T), "High", "Low")
+df_cl_l_2$cd8_class <- ifelse(df_cl_l_2$cd8 >= median(df_cl_l_2$cd8, na.rm = T), "High", "Low")
+
+df_cl_l_1$bcell_class <- ifelse(df_cl_l_1$bcells >= median(df_cl_l_1$bcells, na.rm = T), "High", "Low")
+df_cl_l_2$bcell_class <- ifelse(df_cl_l_2$bcells >= median(df_cl_l_2$bcells, na.rm = T), "High", "Low")
+
+df_cl_l_3 <- rbind(df_cl_l_1, df_cl_l_2)
+
+df_cl_l_3$cd8_foxp3_class <- factor(df_cl_l_3$cd8_foxp3_class, levels = c("High", "Low"))
+df_cl_l_3$foxp3_class <- factor(df_cl_l_3$foxp3_class, levels = c("High", "Low"))
+df_cl_l_3$cd8_class <- factor(df_cl_l_3$cd8_class, levels = c("High", "Low"))
+df_cl_l_3$bcell_class <- factor(df_cl_l_3$bcell_class, levels = c("High", "Low"))
+```
+
+## Fig. 6A
+```{r}
+
+#cd8/foxp3 high low
+cell_class <- c("cd20", "cd20cxcr5", "cd79bCoexp")
+
+cell_label <- c("% of CD20+CXCR5- B cells", "% of CD20+CXCR5+ B cells", "% of CD79b+ B cells")
+# cell_label <- c("% of CD20+CXCR5+ B cells")
+
+for (i in 1:length(cell_class)){
+  print(cell_class[i])
+  pdf(file.path(save_dir, paste0(cell_class[i], "_cd8_to_foxp3_class.pdf")))
+  
+  p <- ggboxplot(subset(df_cl_l_3, !is.na(cd8_foxp3_class)), x = 'cd8_foxp3_class', y = cell_class[i], add = 'jitter', color = 'cd8_foxp3_class', palette = c("firebrick4", "tan3"), facet.by = "Hotspots") + 
+    stat_compare_means(label = "p.format", label.x = 1.3, paired = F) + #label.y = 0.35
+    xlab('') + ylab(cell_label[i]) #+ ylim(c(0,0.4))
+    cus_theme
+  
+  print(p)
+  dev.off()
+  
+}
+
+```
+
+## Fig. 6B
+```{r}
+#bcell perc high low
+cell_class <- c("foxp3", "cd8")
+cell_label <- c("% of CD4+FOXP3+ T cells","% of CD8+ T cells")
+
+for (i in 1:length(cell_class)){
+  print(cell_class[i])
+  pdf(file.path(save_dir, paste0(cell_class[i], "_bcell_class.pdf")))
+  
+  p <- ggboxplot(subset(df_cl_l_3, !is.na(bcell_class)), x = 'bcell_class', y = cell_class[i], add = 'jitter', color = 'bcell_class', palette = c("firebrick4", "tan3"), facet.by = "Hotspots") + 
+    stat_compare_means(label = "p.format", label.x = 1.3, paired = F) + 
+    xlab('') + ylab(cell_label[i]) +
+    cus_theme
+  
+  print(p)
+  dev.off() 
+  
+}
+```
+
+## Fig. 6C
+```{r}
+cell_class <- c("cd8")
+cell_label <- c("% of CD8+ T cells")
+
+for (i in 1:length(cell_class)){
+  print(cell_class[i])
+  pdf(file.path(save_dir, paste0(cell_class[i], "_foxp3_class.pdf")))
+  
+  p <- ggboxplot(subset(df_cl_l_3, !is.na(foxp3_class)), x = 'foxp3_class', y = cell_class[i], add = 'jitter', color = 'foxp3_class', palette = c("firebrick4", "tan3"), facet.by = "Hotspots") + 
+    stat_compare_means(label = "p.format", label.x = 1.3, paired = F) + #, label.y = 1
+    xlab('') + ylab(cell_label[i]) +
+    cus_theme
+  
+  print(p)
+  dev.off()
+  
+}
+
+p.adjust(c(0.016, 0.0048, 0.024, 8.3*10^-6, 0.42, 0.11), "BH")
+p.adjust(c(0.0034, 2.2*10^-7, 0.23, 0.7), "BH")
+p.adjust(c(1.4*10^-5, 0.06), "BH")
+
+```
+
+#Supplementary
+
+## Table. S3 Prognostic assessment of clinical parameters across 100 random splits of discovery and validation cohorts in TCGA LUSC patients.
+```{r}
+#====================S_intra/immune====================#
+
+p_value_all <- c()
+th_value <- c()
+iteration_no <- 100
+set.seed(05112022)
+
+LUSCmean_ <- LUSCmean
+
+for (i in 1:iteration_no){
+LUSCdisc <- sample_n(LUSCmean_, floor(nrow(LUSCmean_)/2))
+LUSCvalid <- subset(LUSCmean_, !(bcr_patient_barcode %in% LUSCdisc$bcr_patient_barcode))
+
+res.cutLUSCd <- surv_cutpoint(LUSCdisc, time = "time", event = "event",
+                              variables = c("fi"))
+
+th_value <- c(th_value, res.cutLUSCd$cutpoint$cutpoint)
+
+res.catLUSCd <- surv_categorize(res.cutLUSCd)
+
+LUSCvalid <- stratify_df(LUSCvalid, "fiC", "fi", res.cutLUSCd)
+
+sur_sta <- survdiff(Surv(time, event)~fiC, data = LUSCvalid)
+
+p_value_all <- c(p_value_all, sur_sta$pvalue)
+  
+}
+#Thresholds
+mean(th_value)
+sd(th_value)
+
+#percentage of iterations with p<0.05
+mean(p_value_all)
+sd(p_value_all)
+length(p_value_all[p_value_all <0.05])/iteration_no
+
+#confidence interval
+l.model <- lm(p_value_all ~ 1)
+confint(l.model, level=0.95)
+
+#====================stages====================#
+p_value_all <- c()
+th_value <- c()
+iteration_no <- 100
+set.seed(05112022)
+
+LUSCmean_ <- LUSCmean
+LUSCmean_ <- subset(LUSCmean_, !is.na(stage_merge))
+
+for (i in 1:iteration_no){
+LUSCdisc <- sample_n(LUSCmean_, floor(nrow(LUSCmean_)/2))
+LUSCvalid <- subset(LUSCmean_, !(bcr_patient_barcode %in% LUSCdisc$bcr_patient_barcode))
+
+sur_sta <- survdiff(Surv(time, event)~stage_merge, data = LUSCvalid)
+
+p_value_all <- c(p_value_all, sur_sta$pvalue)
+}
+
+#percentage of iterations with p<0.05
+mean(p_value_all)
+sd(p_value_all)
+length(p_value_all[p_value_all <0.05])/iteration_no
+
+l.model <- lm(p_value_all ~ 1)
+confint(l.model, level=0.95)
+
+#====================Age====================#
+p_value_all <- c()
+th_value <- c()
+iteration_no <- 100
+set.seed(05112022)
+
+LUSCmean_ <- LUSCmean
+LUSCmean_ <- subset(LUSCmean_, !is.na(age))
+
+for (i in 1:iteration_no){
+LUSCdisc <- sample_n(LUSCmean_, floor(nrow(LUSCmean_)/2))
+LUSCvalid <- subset(LUSCmean_, !(bcr_patient_barcode %in% LUSCdisc$bcr_patient_barcode))
+
+res.cutLUSCd <- surv_cutpoint(LUSCdisc, time = "time", event = "event",
+                              variables = c("age"))
+
+th_value <- c(th_value, res.cutLUSCd$cutpoint$cutpoint)
+
+res.catLUSCd <- surv_categorize(res.cutLUSCd)
+
+LUSCvalid <- stratify_df(LUSCvalid, "ageC", "age", res.cutLUSCd)
+
+sur_sta <- survdiff(Surv(time, event)~ageC, data = LUSCvalid)
+
+p_value_all <- c(p_value_all, sur_sta$pvalue)
+  
+}
+#Thresholds
+mean(th_value)
+sd(th_value)
+
+#percentage of iterations with p<0.05
+mean(p_value_all)
+sd(p_value_all)
+length(p_value_all[p_value_all <0.05])/iteration_no
+
+#confidence interval
+l.model <- lm(p_value_all ~ 1)
+confint(l.model, level=0.95)
+
+#====================Pack years====================#
+p_value_all <- c()
+th_value <- c()
+iteration_no <- 100
+set.seed(05112022)
+
+LUSCmean_ <- LUSCmean
+LUSCmean_ <- subset(LUSCmean_, !is.na(pack_years))
+
+for (i in 1:iteration_no){
+LUSCdisc <- sample_n(LUSCmean_, floor(nrow(LUSCmean_)/2))
+LUSCvalid <- subset(LUSCmean_, !(bcr_patient_barcode %in% LUSCdisc$bcr_patient_barcode))
+
+res.cutLUSCd <- surv_cutpoint(LUSCdisc, time = "time", event = "event",
+                              variables = c("pack_years"))
+
+th_value <- c(th_value, res.cutLUSCd$cutpoint$cutpoint)
+
+res.catLUSCd <- surv_categorize(res.cutLUSCd)
+
+LUSCvalid <- stratify_df(LUSCvalid, "pack_yearsC", "pack_years", res.cutLUSCd)
+
+sur_sta <- survdiff(Surv(time, event)~pack_yearsC, data = LUSCvalid)
+
+p_value_all <- c(p_value_all, sur_sta$pvalue)
+  
+}
+#Thresholds
+mean(th_value)
+sd(th_value)
+
+#percentage of iterations with p<0.05
+mean(p_value_all)
+sd(p_value_all)
+length(p_value_all[p_value_all <0.05])/iteration_no
+
+#confidence interval
+l.model <- lm(p_value_all ~ 1)
+confint(l.model, level=0.95)
+
+#====================TMB====================#
+p_value_all <- c()
+th_value <- c()
+iteration_no <- 100
+set.seed(05112022)
+
+LUSCmean_ <- LUSCmean
+LUSCmean_ <- subset(LUSCmean_, !is.na(total_perMB))
+
+for (i in 1:iteration_no){
+LUSCdisc <- sample_n(LUSCmean_, floor(nrow(LUSCmean_)/2))
+LUSCvalid <- subset(LUSCmean_, !(bcr_patient_barcode %in% LUSCdisc$bcr_patient_barcode))
+
+res.cutLUSCd <- surv_cutpoint(LUSCdisc, time = "time", event = "event",
+                              variables = c("total_perMB"))
+
+th_value <- c(th_value, res.cutLUSCd$cutpoint$cutpoint)
+
+res.catLUSCd <- surv_categorize(res.cutLUSCd)
+
+LUSCvalid <- stratify_df(LUSCvalid, "total_perMBC", "total_perMB", res.cutLUSCd)
+
+sur_sta <- survdiff(Surv(time, event)~total_perMBC, data = LUSCvalid)
+
+p_value_all <- c(p_value_all, sur_sta$pvalue)
+  
+}
+#Thresholds
+mean(th_value)
+sd(th_value)
+
+#percentage of iterations with p<0.05
+mean(p_value_all)
+sd(p_value_all)
+length(p_value_all[p_value_all <0.05])/iteration_no
+
+#confidence interval
+l.model <- lm(p_value_all ~ 1)
+confint(l.model, level=0.95)
+```
+
+## Fig. S1 Validation of H&E image analysis for NSCLC + Fig. S9D
+```{r}
+
+#merges
+LUADtumor <- Reduce(function(x, y) merge(x, y, by ="bcr_patient_barcode", all.x=TRUE), list(LUADmean, LUAD.TCGAPathScores, estLUAD2, absolute2))
+LUSCtumor <- Reduce(function(x, y) merge(x, y, by ="bcr_patient_barcode", all.x=TRUE), list(LUSCmean, LUSC.TCGAPathScores, estLUSC2, absolute2))
+LUADimmune <- Reduce(function(x, y) merge(x, y, by ="bcr_patient_barcode", all.x=TRUE), list(LUADmean, estLUAD2, BoLi2, Davoli))
+LUSCimmune <- Reduce(function(x, y) merge(x, y, by ="bcr_patient_barcode", all.x=TRUE), list(LUSCmean, estLUSC2, BoLi2, Davoli))
+LUADstroma <- Reduce(function(x, y) merge(x, y, by ="bcr_patient_barcode", all.x=TRUE), list(LUADmean, LUAD.TCGAPathScores, estLUAD2))
+LUSCstroma <- Reduce(function(x, y) merge(x, y, by ="bcr_patient_barcode", all.x=TRUE), list(LUSCmean, LUSC.TCGAPathScores, estLUSC2))
+#prepare
+rownames(LUADtumor) <- LUADtumor$bcr_patient_barcode
+rownames(LUSCtumor) <- LUSCtumor$bcr_patient_barcode
+rownames(LUADimmune) <- LUADimmune$bcr_patient_barcode
+rownames(LUSCimmune) <- LUSCimmune$bcr_patient_barcode
+rownames(LUADstroma) <- LUADstroma$bcr_patient_barcode
+rownames(LUSCstroma) <- LUSCstroma$bcr_patient_barcode
+
+LUADtumor <- subset(LUADtumor, select = c(tumour_per, TCGA_pathTumorPer, ARAN_ESTIMATE, ARAN_ABSOLUTE) )
+LUSCtumor <- subset(LUSCtumor, select = c(tumour_per, TCGA_pathTumorPer, ARAN_ESTIMATE, ARAN_ABSOLUTE) )
+
+LUSCimmunefiMCPONLY <-subset(LUSCimmune, select = c(fi, MCPcounter_Tcells, MCPcounter_CD8Tcells, MCPcounter_Cytotoxiclymphocytes, MCPcounter_NKcells, MCPcounter_Blineage, 
+                                                    MCPcounter_Monocyticlineage, MCPcounter_Myeloiddendriticcells, MCPcounter_Neutrophils, MCPcounter_Endothelialcells))
+
+LUSCimmunefi <-subset(LUSCimmune, select = c(fi, DAVOLI_TotNofMutations.in.exons, DAVOLI_TP53Mutation, DAVOLI_CellCycle.Signature.Score, DAVOLI_SCNA.Level, DAVOLI_Chrom.SCNA.Level, 
+                                             DAVOLI_Arm.SCNA.Level, DAVOLI_Focal.SCNA.Level, DAVOLI_Chrom.Arm.SCNA.Level, DAVOLI_SCNA.Level.normalized.by.size, 
+                                             MCPcounter_Tcells, MCPcounter_CD8Tcells, MCPcounter_Cytotoxiclymphocytes, MCPcounter_NKcells, MCPcounter_Blineage, 
+                                             MCPcounter_Monocyticlineage, MCPcounter_Myeloiddendriticcells, MCPcounter_Neutrophils, MCPcounter_Endothelialcells))
+
+LUADimmune <-subset(LUADimmune, select = c(fi, lym_per, ESTIMATE_ImmuneScore, MCPcounter_immune_sum, TIMER_B_cell, TIMER_T_cell.CD4, TIMER_T_cell.CD8, 
+                                           TIMER_Neutrophil, TIMER_Macrophage, TIMER_DC, DAVOLI_TotNofMutations.in.exons, DAVOLI_TP53Mutation, 
+                                           DAVOLI_Immune.Signature.Score, DAVOLI_CellCycle.Signature.Score, DAVOLI_SCNA.Level, DAVOLI_Chrom.SCNA.Level, 
+                                           DAVOLI_Arm.SCNA.Level, DAVOLI_Focal.SCNA.Level, DAVOLI_Chrom.Arm.SCNA.Level, DAVOLI_SCNA.Level.normalized.by.size))
+LUSCimmune <-subset(LUSCimmune, select = c(fi, lym_per, ESTIMATE_ImmuneScore, MCPcounter_immune_sum, TIMER_B_cell, TIMER_T_cell.CD4, TIMER_T_cell.CD8, 
+                                           TIMER_Neutrophil, TIMER_Macrophage, TIMER_DC, DAVOLI_TotNofMutations.in.exons, DAVOLI_TP53Mutation, 
+                                           DAVOLI_Immune.Signature.Score, DAVOLI_CellCycle.Signature.Score, DAVOLI_SCNA.Level, DAVOLI_Chrom.SCNA.Level, 
+                                           DAVOLI_Arm.SCNA.Level, DAVOLI_Focal.SCNA.Level, DAVOLI_Chrom.Arm.SCNA.Level, DAVOLI_SCNA.Level.normalized.by.size))
+
+
+LUADstroma <-subset(LUADstroma, select = c(stromal_per, TCGA_pathStromalPer, ESTIMATE_StromalScore, MCPcounter_stromal_sum))
+LUSCstroma <-subset(LUSCstroma, select = c(stromal_per, TCGA_pathStromalPer, ESTIMATE_StromalScore, MCPcounter_stromal_sum))
+
+tumour <- rbind(LUADtumor, LUSCtumor)
+stroma <- rbind(LUADstroma, LUSCstroma)
+immune <- rbind(LUADimmune, LUSCimmune)
+immune <- subset(immune, select = -c(fi, DAVOLI_TotNofMutations.in.exons, DAVOLI_TP53Mutation, DAVOLI_SCNA.Level, DAVOLI_SCNA.Level, DAVOLI_Chrom.SCNA.Level, 
+                                     DAVOLI_Arm.SCNA.Level, DAVOLI_Focal.SCNA.Level, DAVOLI_Chrom.Arm.SCNA.Level, DAVOLI_SCNA.Level.normalized.by.size, DAVOLI_CellCycle.Signature.Score))
+
+tumour <- na.omit(tumour)
+stroma <- na.omit(stroma)
+immune <- na.omit(immune)
+LUADtumor <- na.omit(LUADtumor)
+LUSCtumor <- na.omit(LUSCtumor)
+LUADimmune <- na.omit(LUADimmune)
+LUSCimmune <- na.omit(LUSCimmune)
+LUADstroma <- na.omit(LUADstroma)
+LUSCstroma <- na.omit(LUSCstroma)
+LUSCimmunefi <- na.omit(LUSCimmunefi)
+LUSCimmunefiMCPONLY <- na.omit(LUSCimmunefiMCPONLY)
+
+### Corr maps
+corTumor <- round(cor(tumour),2)
+corStroma <- round(cor(stroma),2)
+corImmune <- round(cor(immune),2)
+corLUADtumor <- round(cor(LUADtumor),2)
+corLUSCtumor <- round(cor(LUSCtumor),2)
+corLUADimmune <- round(cor(LUADimmune),2)
+corLUSCimmune <- round(cor(LUSCimmune),2)
+corLUADstroma <- round(cor(LUADstroma),2)
+corLUSCstroma <- round(cor(LUSCstroma),2)
+corLUSCimmunefi <- round(cor(LUSCimmunefi),2)
+corLUSCimmunefiMCPONLY <- round(cor(LUSCimmunefiMCPONLY),2)
+
+cor.test(LUSCimmunefiMCPONLY$fi, LUSCimmunefiMCPONLY$MCPcounter_CD8Tcells)
+
+ggcorrplot(corTumor, method = "circle", title = "TCGA NSCLC - cancer cell, n=401")
+ggcorrplot(corStroma, method = "circle", title = "TCGA NSCLC - stroma cell, n=880")
+ggcorrplot(corImmune, method = "circle", title = "TCGA NSCLC - immune cell, n=689")
+
+#Fig. S9D
+ggcorrplot(corLUSCimmunefiMCPONLY, method = "circle", title = "TCGA LUSC - immune hotspot, n=463")
+
+```
+
+
+## Fig. S2 DEGs related to Sintra/immune in TCGA LUAD
+```{r}
+#Compare gene expr of fi high low in LUAD
+variable_pair <- c("High", "Low")
+variable_col <- "fi_class"
+#Volcano plot
+TCGAVisualize_volcano(x = dataDEGs_LUAD$logFC,
+                    y = dataDEGs_LUAD$FDR,
+                    filename = file.path(save_dir, paste0(variable_col, "_", variable_pair[1], "_", variable_pair[2], "_volcano_LUAD.pdf")),
+                    x.cut = 3,
+                    y.cut = 10^-5,
+                    names = rownames(dataDEGs_LUAD),
+                    color = c("black","red","darkgreen"),
+                    names.size = 2,
+                    xlab = " Gene expression fold change (Log2)",
+                    legend = "State",
+                    highlight = c("CD19", "CD79B", "MS4A1", "CD20", "CXCR5", "FCER2"),
+                    title = paste0("Volcano plot (", variable_col, ", ", variable_pair[1], " vs ", variable_pair[2], ")"),
+                    show.names = "both",
+                    width = 10)
+#EA plot
+TCGAvisualize_EAbarplot(tf = rownames(ansEA_LUAD$ResBP), 
+                    GOBPTab = ansEA_LUAD$ResBP,
+                    GOCCTab = ansEA_LUAD$ResCC,
+                    GOMFTab = ansEA_LUAD$ResMF,
+                    PathTab = ansEA_LUAD$ResPat,
+                    nRGTab = Genelist_LUAD, 
+                    nBar = 10,
+                    filename=file.path(save_dir, paste0(variable_col, "_", variable_pair[1], "_", variable_pair[2], "_logFc_all_LUAD.pdf")))
+
+```
+
+## Fig. S3 Assessment of registration quality and the lymphocyte densities of serial H&E and IHC sections of 10 LUSC patients.
+```{r}
+#============ A ===============#
+rtre$mean_rTRE <- rtre$mean_rTRE*100
+ggdensity(rtre, x = 'mean_rTRE', rug = TRUE, add = 'mean', xlab = 'Mean Target Registration Error (%)', ylab = 'Density', color = "tomato2") + cus_theme
+
+#============ B ===============#
+
+lym_list <- c("cd4","cd8","foxp3","cd20","cd20cxcr5","cd79bCoexp")
+
+sum_df <- data.frame(slide  = sum_valid$slide, hs = sum_valid$Hotspots, p40=sum_valid$p40, 
+                     cell.count.c = sum_valid$cell.count.c, cell.count.l =sum_valid$cell.count.l,
+                     lym_ihc = rowSums(sum_valid[,lym_list]), x.s= sum_valid$x.s, y.s = sum_valid$y.s)
+
+df <- subset(sum_df, hs %in% c('Cancer-immune','Immune'))  %>% 
+  group_by(slide,hs) %>% 
+  summarise(p40 = sum(p40,na.rm=TRUE), cell.count.c = sum(cell.count.c,na.rm=TRUE), 
+            cell.count.l = sum(cell.count.l, na.rm=TRUE),
+            lym_ihc = sum(lym_ihc, na.rm=TRUE), area = paste(x.s, y.s) %>% unique %>% length())
+
+df[,setdiff(colnames(df), c("slide","hs"))] <- df[,setdiff(colnames(df), c("slide","hs"))] / df$area / (50*50) * 10^6
+#levels(df$hs) <- c('Cancer','Cancer-immune','Else','Immune')
+colnames(df)[which(colnames(df)=='hs')] <- 'Hotspots'
+
+#cancer
+scatter_cancer <- ggscatter(df, x = 'cell.count.c', y = 'p40', add = "reg.line",                
+          conf.int = TRUE, color='Hotspots',  palette = c("#EE0000","#00BFFF"),              
+          add.params = list(color = "gray40",
+                            fill = "lightgray"), 
+          ylab = expression("P40"^"+"~"cell / "~mm^2),
+          xlab = expression("H&E-based cancer cell / "~mm^2)) + stat_cor(method = "pearson") + cus_theme + coord_fixed(ratio = 1)
+
+#lymphocyte
+scatter_lym <- ggscatter(df, x = 'cell.count.l', y = 'lym_ihc', add = "reg.line",                     
+          conf.int = TRUE,  color = 'Hotspots', palette = c("#EE0000","#00BFFF"),              
+          add.params = list(color = "gray40",
+                            fill = "lightgray"), 
+          xlab = expression("H&E-based lymphocyte cell / "~mm^2),
+          ylab = expression("IHC-based lymphocyte cell / "~mm^2)) + stat_cor(method = "pearson") + cus_theme + coord_fixed(ratio = 0.6)
+
+ggarrange(scatter_cancer, scatter_lym, ncol = 2)
+
+#============ C ===============#
+df <- sum_valid %>% group_by(slide, Hotspots) %>% summarise(cd8 = sum(cd8, na.rm = TRUE), cd4 = sum(cd4, na.rm = TRUE),
+                                                                  foxp3 = sum(foxp3, na.rm=TRUE), cd20 = sum(cd20, na.rm=TRUE),
+                                                                  cd20cxcr5 = sum(cd20cxcr5, na.rm = TRUE), cd79bCoexp = sum(cd79bCoexp, na.rm=TRUE))
+
+
+df_sum <- sum_valid %>% group_by(slide) %>% summarise(cd8 = sum(cd8, na.rm = TRUE), cd4 = sum(cd4, na.rm = TRUE),
+                                                                      foxp3 = sum(foxp3, na.rm=TRUE), cd20 = sum(cd20, na.rm=TRUE),
+                                                                      cd20cxcr5 = sum(cd20cxcr5, na.rm = TRUE), cd79bCoexp = sum(cd79bCoexp, na.rm=TRUE))
+
+
+df <- merge(df, df_sum, by = 'slide')
+
+
+df[,3:8] <- df[,3:8]/df[,9:14] * 100
+df_m <- melt(df[,1:8], id.vars = c("Hotspots", "slide"))
+df_m$Hotspots <- factor(df_m$Hotspots, levels = c("Cancer-immune", "Immune", "Cancer", "Else"))
+
+
+my_comparison<- list(c("Cancer-immune", "Immune"), c("Cancer-immune", "Cancer"))
+p <- ggboxplot(df_m, x = "variable", y = "value", color = "Hotspots", add = "jitter",
+          palette = c("#A0C588","#636AA8", '#C1534E', '#E4C1C1')) + stat_compare_means(comparisons = my_comparison)
+
+df_compare <- compare_means(value ~ Hotspots, p.adjust.method = "BH", method='wilcox.test', paired = T,
+              group.by = "variable",
+              data =  df_m) %>%
+  mutate( p.adj = format.pval(p.adj, digits = 2),
+         p_adj_star = ifelse(as.numeric(gsub("< ", "", p.adj)) <0.0001, '****', 
+                             ifelse(as.numeric(gsub("< ", "", p.adj)) < 0.001, '***', 
+                                    ifelse(as.numeric(gsub("< ", "", p.adj)) < 0.01, '**', 
+                                           ifelse(as.numeric(gsub("< ", "", p.adj)) < 0.05, '*', '')))))  %>%
+  mutate(line_color = ifelse(p_adj_star == "", "white", "black"))
+
+#============ D ===============#
+
+df <- sum_valid %>% group_by(slide, Hotspots) %>% summarise(cd8 = sum(cd8, na.rm = TRUE), cd4 = sum(cd4, na.rm = TRUE),
+foxp3 = sum(foxp3, na.rm=TRUE), cd20 = sum(cd20, na.rm=TRUE), cd20cxcr5 = sum(cd20cxcr5, na.rm = TRUE), cd79bCoexp = sum(cd79bCoexp, na.rm=TRUE))
+
+df_sum <- sum_valid %>% group_by(slide) %>% summarise(cd8 = sum(cd8, na.rm = TRUE), cd4 = sum(cd4, na.rm = TRUE),
+foxp3 = sum(foxp3, na.rm=TRUE), cd20 = sum(cd20, na.rm=TRUE), cd20cxcr5 = sum(cd20cxcr5, na.rm = TRUE), cd79bCoexp = sum(cd79bCoexp, na.rm=TRUE))
+
+
+df <- merge(df, df_sum, by = 'slide')
+
+df[,3:8] <- df[,3:8]/rowSums(df[,9:14]) * 100
+df_m <- melt(df[,1:8], id.vars = c("Hotspots", "slide"))
+df_m$Hotspots <- factor(df_m$Hotspots, levels = c("Cancer-immune", "Immune", "Cancer", "Else"))
+
+
+my_comparison<- list(c("Cancer-immune", "Immune"), c("Cancer-immune", "Cancer"))
+p <- ggboxplot(df_m, x = "variable", y = "value", color = "Hotspots", add = "jitter",
+          palette = c("#A0C588","#636AA8", '#C1534E', '#E4C1C1')) + stat_compare_means(comparisons = my_comparison)
+
+df_compare <- compare_means(value ~ Hotspots, p.adjust.method = "BH", method='wilcox.test', paired = T,
+              group.by = "variable",
+              data =  df_m) %>%
+  mutate( p.adj = format.pval(p.adj, digits = 2),
+         p_adj_star = ifelse(as.numeric(gsub("< ", "", p.adj)) <0.0001, '****', 
+                             ifelse(as.numeric(gsub("< ", "", p.adj)) < 0.001, '***', 
+                                    ifelse(as.numeric(gsub("< ", "", p.adj)) < 0.01, '**', 
+                                           ifelse(as.numeric(gsub("< ", "", p.adj)) < 0.05, '*', '')))))  %>%
+  mutate(line_color = ifelse(p_adj_star == "", "white", "black"))
+
+```
+
+## Fig. S4 Prognostic significance of Sintra/cancer and Sintra/tissue in TCGA LUSC patients.
+```{r}
+LUSCdisc <- subset(LUSCmean, cohort == "disc")
+#============ A, C ===============#
+#Sintra/cancer
+res.cutLUSCd <- surv_cutpoint(LUSCdisc, time = "time", event = "event",
+                              variables = c("fc"))
+res.catLUSCd <- surv_categorize(res.cutLUSCd)
+
+LUSCmean_ <- stratify_df(LUSCmean, "fcC", "fc", res.cutLUSCd)
+
+##survival plot
+fit <- survfit(Surv(time, event)~fcC, data = LUSCmean_)
+
+ggsurvplot(fit, data = LUSCmean_, risk.table = T,  break.time.by = 500, 
+           ylab = "Overall Survival",
+           xlab = "Time (Days)",
+           palette = c("#00BFFF", "#EE0000"),
+           pval = T, pval.coord = c(0.1, 0.1))
+
+fitd <- coxph(Surv(time, event)~fcC+age+stage_merge+pack_years, data = LUSCmean_)
+ggforest(fitd, main = "TCGA LUSC: discovery + validation cohort")
+
+#============ B, D ===============#
+#Sintra/tissue
+res.cutLUSCd <- surv_cutpoint(LUSCdisc, time = "time", event = "event",
+                              variables = c("ft"))
+res.catLUSCd <- surv_categorize(res.cutLUSCd)
+
+LUSCmean_ <- stratify_df(LUSCmean, "ftC", "ft", res.cutLUSCd)
+
+##survival plot
+fit <- survfit(Surv(time, event)~ftC, data = LUSCmean_)
+
+ggsurvplot(fit, data = LUSCmean_, risk.table = T,  break.time.by = 500, 
+           ylab = "Overall Survival",
+           xlab = "Time (Days)",
+           palette = c("#00BFFF", "#EE0000"),
+           pval = T, pval.coord = c(0.1, 0.1))
+
+fitd <- coxph(Surv(time, event)~ftC+age+stage_merge+pack_years, data = LUSCmean_)
+ggforest(fitd, main = "TCGA LUSC: discovery + validation cohort")
+
+```
+
+## Fig. S5 Prognostic significance of Sintra/peri in TCGA NSCLC patients with different smoking histories.
+```{r}
+#LUAD
+p_sur_luad_1 <- plt_sur_by_smokingClass(LUADmean, "1", "Current reformed smoker for <= 15 years")
+p_sur_luad_2 <- plt_sur_by_smokingClass(LUADmean, "2", "Current reformed smoker for > 15 years")
+p_sur_luad_3 <- plt_sur_by_smokingClass(LUADmean, "3", "Current smoker")
+p_sur_luad_4 <- plt_sur_by_smokingClass(LUADmean, "4", "Lifelong non-smoker")
+
+LUADmean_1 <- subset(LUADmean, smokingClass %in% c('1','2','3','4'))
+LUADmean_1<- subset(LUADmean_1, time>=0)
+
+LUADdisc_1 <- LUADmean_1[1:round(nrow(LUADmean_1)/2) ,]
+
+res.cutLUADd <- surv_cutpoint(LUADdisc_1, time = "time", event = "event",
+                              variables = c("fi"))
+res.catLUADd <- surv_categorize(res.cutLUADd)
+
+LUADmean_1 <- stratify_df(LUADmean_1, "fiC", "fi", res.cutLUADd)
+
+fita <- coxph(Surv(time, event)~fiC+stage_merge+smokingClass, data = LUADmean_1)
+ggforest(fita, data = NULL, main = "", fontsize = 0.7, refLabel = "", noDigits = 2)
+
+#LUSC
+p_sur_lusc_1 <- plt_sur_by_smokingClass(LUSCmean, "1", "Current reformed smoker for <= 15 years")
+p_sur_lusc_2 <- plt_sur_by_smokingClass(LUSCmean, "2", "Current reformed smoker for > 15 years")
+p_sur_lusc_3 <- plt_sur_by_smokingClass(LUSCmean, "3", "Current smoker")
+p_sur_lusc_4 <- plt_sur_by_smokingClass(LUSCmean, "4", "Lifelong non-smoker")
+
+LUSCmean_1 <- subset(LUSCmean, smokingClass %in% c('1','2','3','4'))
+LUSCmean_1<- subset(LUSCmean_1, time>=0)
+
+LUSCdisc_1 <- LUSCmean_1[1:round(nrow(LUSCmean_1)/2) ,]
+
+res.cutLUSCd <- surv_cutpoint(LUSCdisc_1, time = "time", event = "event",
+                              variables = c("fi"))
+
+LUSCmean_1 <- stratify_df(LUSCmean_1, "fiC", "fi", res.cutLUSCd)
+
+fita <- coxph(Surv(time, event)~fiC+stage_merge+smokingClass, data = LUSCmean_1)
+ggforest(fita, data = NULL, main = "", fontsize = 0.7, refLabel = "", noDigits = 2)
+
+```
+
+## Fig. S6 Prognostic significance of three immune scores in TCGA LUAD patients
+```{r}
+LUADdisc <- subset(LUADmean, cohort == "disc")
+LUADvalid <- subset(LUADmean, cohort == "valid")
+
+#S_intra/immune
+#########################
+#Optimize threshold for the discovery set
+res.cutLUADd <- surv_cutpoint(LUADdisc, time = "time", event = "event",
+                              variables = c("fi"))
+res.catLUADd <- surv_categorize(res.cutLUADd)
+
+#disc
+LUADdisc <- stratify_df(LUADdisc, "fiC", "fi", res.cutLUADd)
+
+fit <- survfit(Surv(time, event)~fiC, data = LUADdisc)
+
+ggsurvplot(fit, data = LUADdisc, risk.table = T,  break.time.by = 500, 
+           ylab = "Overall Survival",
+           xlab = "Time (Days)",
+           palette = c("#00BFFF", "#EE0000"),
+           pval = T, pval.coord = c(0.1, 0.1))
+
+#valid
+LUADvalid <- stratify_df(LUADvalid, "fiC", "fi", res.cutLUADd)
+
+fit <- survfit(Surv(time, event)~fiC, data = LUADvalid)
+
+ggsurvplot(fit, data = LUADvalid, risk.table = T,  break.time.by = 500, 
+           ylab = "Overall Survival",
+           xlab = "Time (Days)",
+           palette = c("#00BFFF", "#EE0000"),
+           pval = T, pval.coord = c(0.1, 0.1))
+
+#combined
+
+LUADmean <- stratify_df(LUADmean, "fiC", "fi", res.cutLUADd)
+
+fit <- survfit(Surv(time, event)~fiC, data = LUADmean)
+
+ggsurvplot(fit, data = LUADmean, risk.table = T,  break.time.by = 500, 
+           ylab = "Overall Survival",
+           xlab = "Time (Days)",
+           palette = c("#00BFFF", "#EE0000"),
+           pval = T, pval.coord = c(0.1, 0.1))
+#########################
+
+#S_intra/cancer
+#########################
+#Optimize threshold for the discovery set
+res.cutLUADd <- surv_cutpoint(LUADdisc, time = "time", event = "event",
+                              variables = c("fc"))
+res.catLUADd <- surv_categorize(res.cutLUADd)
+
+#disc
+LUADdisc <- stratify_df(LUADdisc, "fcC", "fc", res.cutLUADd)
+
+fit <- survfit(Surv(time, event)~fcC, data = LUADdisc)
+
+ggsurvplot(fit, data = LUADdisc, risk.table = T,  break.time.by = 500, 
+           ylab = "Overall Survival",
+           xlab = "Time (Days)",
+           palette = c("#00BFFF", "#EE0000"),
+           pval = T, pval.coord = c(0.1, 0.1))
+
+#valid
+LUADvalid <- stratify_df(LUADvalid, "fcC", "fc", res.cutLUADd)
+
+fit <- survfit(Surv(time, event)~fcC, data = LUADvalid)
+
+ggsurvplot(fit, data = LUADvalid, risk.table = T,  break.time.by = 500, 
+           ylab = "Overall Survival",
+           xlab = "Time (Days)",
+           palette = c("#00BFFF", "#EE0000"),
+           pval = T, pval.coord = c(0.1, 0.1))
+
+#combined
+
+LUADmean <- stratify_df(LUADmean, "fcC", "fc", res.cutLUADd)
+
+fit <- survfit(Surv(time, event)~fcC, data = LUADmean)
+
+ggsurvplot(fit, data = LUADmean, risk.table = T,  break.time.by = 500, 
+           ylab = "Overall Survival",
+           xlab = "Time (Days)",
+           palette = c("#00BFFF", "#EE0000"),
+           pval = T, pval.coord = c(0.1, 0.1))
+#########################
+
+#S_intra/tissue
+#########################
+#Optimize threshold for the discovery set
+res.cutLUADd <- surv_cutpoint(LUADdisc, time = "time", event = "event",
+                              variables = c("ft"))
+res.catLUADd <- surv_categorize(res.cutLUADd)
+
+#disc
+LUADdisc <- stratify_df(LUADdisc, "ftC", "ft", res.cutLUADd)
+
+fit <- survfit(Surv(time, event)~ftC, data = LUADdisc)
+
+ggsurvplot(fit, data = LUADdisc, risk.table = T,  break.time.by = 500, 
+           ylab = "Overall Survival",
+           xlab = "Time (Days)",
+           palette = c("#00BFFF", "#EE0000"),
+           pval = T, pval.coord = c(0.1, 0.1))
+
+#valid
+LUADvalid <- stratify_df(LUADvalid, "ftC", "ft", res.cutLUADd)
+
+fit <- survfit(Surv(time, event)~ftC, data = LUADvalid)
+
+ggsurvplot(fit, data = LUADvalid, risk.table = T,  break.time.by = 500, 
+           ylab = "Overall Survival",
+           xlab = "Time (Days)",
+           palette = c("#00BFFF", "#EE0000"),
+           pval = T, pval.coord = c(0.1, 0.1))
+
+#combined
+
+LUADmean <- stratify_df(LUADmean, "ftC", "ft", res.cutLUADd)
+
+fit <- survfit(Surv(time, event)~ftC, data = LUADmean)
+
+ggsurvplot(fit, data = LUADmean, risk.table = T,  break.time.by = 500, 
+           ylab = "Overall Survival",
+           xlab = "Time (Days)",
+           palette = c("#00BFFF", "#EE0000"),
+           pval = T, pval.coord = c(0.1, 0.1))
+#########################
+```
+
+## Fig. S7 Survival test of lymphocyte abundance in TCGA LUSC and LUAD cohort.
+```{r}
+LUSCdisc <- subset(LUSCmean, cohort == "disc")
+
+#============ A, C ===============#
+
+res.cutLUSCd <- surv_cutpoint(LUSCdisc, time = "time", event = "event",
+                              variables = c("lym_per"))
+res.catLUSCd <- surv_categorize(res.cutLUSCd)
+
+LUSCmean_ <- stratify_df(LUSCmean, "lym_perC", "lym_per", res.cutLUSCd)
+
+##survival plot
+fit <- survfit(Surv(time, event)~lym_perC, data = LUSCmean_)
+
+ggsurvplot(fit, data = LUSCmean_, risk.table = T,  break.time.by = 500, 
+           ylab = "Overall Survival",
+           xlab = "Time (Days)",
+           palette = c("#00BFFF", "#EE0000"),
+           pval = T, pval.coord = c(0.1, 0.1))
+
+fitd <- coxph(Surv(time, event)~lym_perC+age+stage_merge+pack_years, data = LUSCmean_)
+ggforest(fitd, main = "TCGA LUSC: discovery + validation cohort")
+
+#============ B, D ===============#
+LUADdisc <- subset(LUADmean, cohort == "disc")
+
+res.cutLUSCd <- surv_cutpoint(LUADdisc, time = "time", event = "event",
+                              variables = c("lym_per"))
+res.catLUSCd <- surv_categorize(res.cutLUSCd)
+
+LUADmean_ <- stratify_df(LUADmean, "lym_perC", "lym_per", res.cutLUSCd)
+
+##survival plot
+fit <- survfit(Surv(time, event)~lym_perC, data = LUADmean_)
+
+ggsurvplot(fit, data = LUADmean_, risk.table = T,  break.time.by = 500, 
+           ylab = "Overall Survival",
+           xlab = "Time (Days)",
+           palette = c("#00BFFF", "#EE0000"),
+           pval = T, pval.coord = c(0.1, 0.1))
+
+fitd <- coxph(Surv(time, event)~lym_perC+age+stage_merge+pack_years, data = LUADmean_)
+ggforest(fitd, main = "TCGA LUAD: discovery + validation cohort")
+
+```
+
+## Fig. S9 Immunological phenotype of immune hotspots orchestrated by infiltrating B cells and T regulatory cells.
+```{r}
+#============ A ===============#
+
+#exhaustedB signature 
+grep("CD27", rownames(dataFiltT), value = TRUE)
+exhaustedB <- as.data.frame( dataFiltT[c("CD19", "CD4", "CD69", "CD27", "MS4A1", "FOXP3", 
+                                         "CD8A", "CD8B" ,"CD80" ,"CD86", "CD81" ,"CD82", "CD84", "CD83", "CR2" ),])
+exhaustedB <- as.data.frame(t(exhaustedB))
+exhaustedB$id2 <- rownames(exhaustedB)
+
+exhaustedB <- merge(exhaustedB, col, by = "id2")
+#take out the outlier in row 381 TCGA-85-A4PA-01A-11R-A24Z-07
+#exhaustedB <- exhaustedB[-c(381),]
+
+ggscatter(exhaustedB, x = "FOXP3", y = "CD27", color = "condition",
+          add = "reg.line", conf.int = TRUE, size = 2,
+          add.params = list(color = "blue",
+                            fill = "lightgray"), title = "TCGA LUSC (n = 466)",
+          cor.coef = TRUE, cor.method = "spearman")
+my_comparisons <- list( c("high", "low"))
+
+ggboxplot(exhaustedB, x = "condition", y = "FOXP3", add = "jitter", color = "condition", title = "TCGA LUSC (n=466)",
+          palette = c("#EE0000", "#00BFFF")) +stat_compare_means(comparisons = my_comparisons)
+ggboxplot(exhaustedB, x = "condition", y = "CD27", add = "jitter", color = "condition", title = "TCGA LUSC (n=466)",
+          palette = c("#EE0000", "#00BFFF")) +stat_compare_means(comparisons = my_comparisons)
+
+
+#take out the outlier in row 381 TCGA-85-A4PA-01A-11R-A24Z-07
+exhaustedBOutlier <- exhaustedB[-c(381),]
+exhaustedBOutlier <- exhaustedBOutlier[order(exhaustedBOutlier$condition),]  #order for the heatmap!
+annot <- subset(exhaustedBOutlier, select = c(id2, condition))
+rownames(annot) <- annot$id2
+annot <- subset(annot, select = -c(id2))
+
+mapBcell <- subset(exhaustedBOutlier, select = -c(bcr_patient_barcode, id, condition, 
+                                                  CD8B, CD80, CD86, CD81, CD82, CD84, CD83))
+
+corBcell <- subset(mapBcell, select = -c(id2))
+rownames(mapBcell) <- mapBcell$id2
+mapBcell <- subset(mapBcell, select = -c(id2))
+mapBcell <- t(mapBcell)
+condition = c("#EE0000", "#00BFFF")
+names(condition) = c("high", "low")
+ann_colors = list(condition = condition)
+
+#============ B ===============#
+mapBcelllog <- log10(mapBcell+1)
+pheatmap(mapBcelllog, annotation = annot,annotation_legend = T, annotation_colors = ann_colors, show_colnames= F, 
+         gaps_col =  3, cluster_rows=T, cluster_cols=T, drop_levels = F, border_color = NA)
+
+grid.ls(grid.force()) # "col_annotation" looks like it's the one to edit
+# grid.gedit("col_annotation", gp = gpar(col="grey70"))
+
+#============ C ===============#
+matcorBcell <- round(cor(corBcell),2)
+ggcorrplot(matcorBcell, method = "square", hc.order = TRUE, type = "upper", lab=TRUE,
+           outline.col = "white", title = "TCGA LUSC, n=462")
+
+```
+
+##Fig. S10 The association between S_(intra/immune) and TMB, PD1, PD-L1, and neoantigens in LUSC
+- ======TMB======
+- Download maf files and clinical data for TCGA-LUSC from the [GDC portal](https://portal.gdc.cancer.gov/repository)
+- Select the authorized files (549 from 490 cases)
+- Combine all maf files into one: bash move_maf.sh maf_dir LUSC_549.maf
+- Format the 'Tumor_Sample_Barcode' column in LUSC_549.maf to Project-TSS-Participant: python tcga_format.py LUSC_549.maf > LUSC_549_sort.maf
+- For the clinical.tsv, change column name 'submitted_id' to 'Tumor_Sample_Barcode'
+- Analyse with [maftools](https://www.bioconductor.org/packages/devel/bioc/vignettes/maftools/inst/doc/maftools.html)
+- Merge TMB column with LUSCmean dataset
+```{r}
+#============ A ===============#
+lusc.mutload_merge <- merge(lusc.mutload, col, by.x = "Tumor_Sample_Barcode", by.y = "bcr_patient_barcode", all.y=TRUE)
+lusc.mutload_merge <- subset(lusc.mutload_merge, !is.na(total_perMB_log))
+lusc.mutload <- lusc.mutload[order(lusc.mutload$Tumor_Sample_Barcode),]
+
+#plot
+my_comparisons <- list( c("high", "low"))
+
+pdf(file.path(save_dir, "TMB_high_low.pdf"), width = 6, height = 6)
+p <- ggboxplot(lusc.mutload_merge, x = "condition", y = "total_perMB", add = "jitter", color = "condition", title = paste0("TCGA LUSC (n=", nrow(lusc.mutload_merge), ")"),
+          palette = c("#EE0000", "#00BFFF")) +stat_compare_means(comparisons = my_comparisons) +
+          cus_theme +
+          xlab("S_intra/immune") + ylab('Somatic mutation frequency (/Mb)')
+print(p)
+dev.off()
+
+#============ B, C, D ===============#
+load("data/survival_LUSC_LUAD_v3.RData")
+
+LUSCmean_ <- subset(LUSCmean, !is.na(total_perMB))
+
+LUSCdisc <- subset(LUSCmean_, cohort == 'disc')
+LUSCvalid <- subset(LUSCmean_, cohort == 'valid')
+
+res.cutLUSCd <- surv_cutpoint(LUSCdisc, time = "time", event = "event", minprop = 0.2,
+                             variables = c("total_perMB", "fi"))
+
+LUSCmean_ <- stratify_df(LUSCmean_, "fiC", "fi", res.cutLUSCd)
+LUSCmean_ <- stratify_df(LUSCmean_, "total_perMBC", "total_perMB", res.cutLUSCd)
+
+fit <- survfit(Surv(time, event)~total_perMBC + fiC, data = LUSCmean_)
+
+pdf(file.path(save_dir, "sur_TMB_fi_optimal_disc.pdf"), width = 11, height = 8, onefile = F)
+ggsurvplot(fit, data = LUSCmean_, risk.table = T,  break.time.by = 500, 
+           ylab = "Overall Survival",
+           xlab = "Time (Days)",
+           #palette = c("#00BFFF", "#EE0000"),
+           pval = T, pval.coord = c(0.1, 0.1))
+dev.off()
+
+#TMB survival on its own
+
+LUSCmean_$total_perMBC <- factor(LUSCmean_$total_perMBC, levels = c("High", "Low"))
+fit <- survfit(Surv(time, event)~total_perMBC, data = LUSCmean_)
+
+pdf(file.path(save_dir, "sur_TMB_fi.pdf"), width = 11, height = 8, onefile = F)
+ggsurvplot(fit, data = LUSCmean_, risk.table = T,  break.time.by = 500, 
+           ylab = "Overall Survival",
+           xlab = "Time (Days)",
+           palette = c("#00BFFF", "#EE0000"),
+           pval = T, pval.coord = c(0.1, 0.1))
+dev.off()
+
+#TMB High + Sintra/immune low
+
+LUSCmean_$Stratification <- ifelse(LUSCmean_$total_perMB > res.cutLUSCd$total_perMB$estimate[[1]] & LUSCmean_$fi <= res.cutLUSCd$fi$estimate[[1]], "High TMB low S_intra/immune", "Others")
+
+fit <- survfit(Surv(time, event)~Stratification, data = LUSCmean_)
+
+pdf(file.path(save_dir, "sur_TMB_fi_merge.pdf"), width = 13, height = 8, onefile = F)
+ggsurvplot(fit, data = LUSCmean_, risk.table = T,  break.time.by = 500, 
+           ylab = "Overall Survival",
+           xlab = "Time (Days)",
+           palette = c("#00BFFF", "#EE0000"),
+           pval = T, pval.coord = c(0.1, 0.1))
+dev.off()
+
+
+#Forest plot
+
+LUSCmean_$total_perMBC <- factor(LUSCmean_$total_perMBC, levels = c("High", "Low"))
+
+fita <- coxph(Surv(time, event)~fiC + total_perMBC + age + stage_merge + pack_years, data = LUSCmean_)
+
+pdf(file.path(save_dir, "sur_TMB_optimal_multi_fi_disc_v1.pdf"), width = 8, height = 8, onefile = F)
+ggforest(fita, data = LUSCmean_, main = "", fontsize = 0.7, refLabel = "", noDigits = 2)
+dev.off()
+
+#============ E, F ===============#
+
+#PDL1 https://www.ncbi.nlm.nih.gov/gene/29126
+grep("CD274", rownames(dataFiltT), value = TRUE)
+#PD1 https://www.ncbi.nlm.nih.gov/gene/5133
+grep("PDCD1", rownames(dataFiltT), value = TRUE)
+
+pd1_pdl1 <- as.data.frame( dataFiltT[c("PDCD1", "CD274" ),])
+pd1_pdl1 <- as.data.frame(t(pd1_pdl1))
+pd1_pdl1$id2 <- rownames(pd1_pdl1)
+
+pd1_pdl1 <- merge(pd1_pdl1, col, by = "id2")
+
+my_comparisons <- list( c("high", "low"))
+
+#PD1, p = 0.19
+pdf(file.path(save_dir, "PD1_LUSC_S_high_low.pdf"), width = 6, height = 6)
+ggboxplot(pd1_pdl1, x = "condition", y = "PDCD1", add = "jitter", color = "condition", title = paste0("TCGA LUSC (n=", dim(pd1_pdl1)[1], ")"),
+          palette = c("#EE0000", "#00BFFF")) + ylab('PD1 (normalized read counts)') +
+          stat_compare_means(comparisons = my_comparisons)
+dev.off()
+
+#PDL1, p = 0.12
+pdf(file.path(save_dir, "PDL1_LUSC_S_high_low.pdf"), width = 6, height = 6)
+ggboxplot(pd1_pdl1, x = "condition", y = "CD274", add = "jitter", color = "condition", title = paste0("TCGA LUSC (n=", dim(pd1_pdl1)[1], ")"),
+          palette = c("#EE0000", "#00BFFF")) + ylab('PD-L1 (normalized read counts)') +
+          stat_compare_means(comparisons = my_comparisons)
+dev.off()
+
+#============ G ===============#
+#Clonal neoantigens
+res.cutLUSC <- surv_cutpoint(LUSCmean, time = "time", event = "event",
+                              variables = c("fi"), minprop = 0.2)
+res.catLUSC <- surv_categorize(res.cutLUSC)
+LUSCmean_ <- LUSCmean
+LUSCmean_$fi_class <- ifelse(LUSCmean_$fi > res.cutLUSC$fi$estimate, "High", "Low")
+
+pdf(file.path(save_dir, "LUSC_neoantigen_fi.pdf"), width = 6, height = 6, onefile = F)
+ggboxplot(subset(LUSCmean_,!is.na(fi_class)), x = "fi_class", y = "ClonalNeoAntigens", add = "jitter", color = "fi_class", title = paste0("TCGA LUSC (n=", dim(subset(LUSCmean_,!is.na(ClonalNeoAntigens)))[1], ")"),
+          palette = c("#EE0000", "#00BFFF")) + #+ ylab('PD1 (normalized read counts)') +
+          stat_compare_means()
+dev.off()
+
+```
+
