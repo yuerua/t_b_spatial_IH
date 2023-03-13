@@ -3,6 +3,7 @@ data/TCGA/TCGA_LUSC-biolinksGeneExp_immuneHotspot.RData
 
 # Byte-compiled / optimized / DLL files
 .gitattributes
+.Rhistory
 __pycache__/
 *.py[cod]
 *$py.class
