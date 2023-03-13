@@ -12,6 +12,8 @@ Scripts for data analysis conducted for paper “Spatial Positioning of Immune H
 
 - Download data to the same directory. 
 
+- Note: TCGA_LUSC-biolinksGeneExp_immuneHotspot.RData is available at [link](https://www.dropbox.com/s/fc5qtc8773hzdkh/TCGA_LUSC-biolinksGeneExp_immuneHotspot.RData?dl=0)
+
   ```bash
   data
   ├── TCGA
